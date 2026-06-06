@@ -69,12 +69,12 @@ def get_road_width_for_scale(road_type, scale, is_interacting, lod_roads_thresho
     elif scale < 0.015:
         base_widths = {
             'motorway': 5.0, 'trunk': 4.5, 'primary': 3.5, 'secondary': 2.5, 'tertiary': 2.0, 
-            'unclassified': 1.5, 'residential': 1.0, 'living_street': 0.8, 'service': 0.6, 'pedestrian': 0.6
+            'unclassified': 1.5, 'residential': 1.0, 'living_street': 1.0, 'service': 0.8, 'pedestrian': 0.8
         }
     else:
         base_widths = {
             'motorway': 7.0, 'trunk': 6.0, 'primary': 5.0, 'secondary': 4.0, 'tertiary': 3.0, 
-            'unclassified': 2.5, 'residential': 1.5, 'living_street': 1.2, 'service': 1.0, 'pedestrian': 1.0
+            'unclassified': 2.5, 'residential': 1.5, 'living_street': 1.5, 'service': 1.2, 'pedestrian': 1.2
         }
         
     return base_widths.get(road_type, 1.0)
