@@ -453,12 +453,12 @@ class MapWidget(QWidget):
         elapsed = end - start
         
         # 300 iterations * 100 points = 30,000 points processed.
-        # Estimate capacity for a target 8ms Python processing time (remaining 8.7ms for Qt C++ rendering)
+        # Estimate capacity for a target 250ms background render time.
         points_per_sec = 30000.0 / max(0.0001, elapsed)
-        budget = points_per_sec * 0.008  # 8ms frame budget share
+        budget = points_per_sec * 0.250  # 250ms background rendering target
         
-        # Clamp to reasonable bounds: 10,000 to 500,000 points
-        budget = max(10000.0, min(500000.0, budget))
+        # Clamp to reasonable bounds: 200,000 to 2,500,000 points
+        budget = max(200000.0, min(2500000.0, budget))
         print(f"Machine benchmark capacity: {points_per_sec:.0f} points/sec. Assigned target budget: {budget:.0f} points/frame.")
         return budget
         
