@@ -21,6 +21,7 @@ import rules
 SETTINGS_PATH = r"./dev_settings.json"
 
 from utils import inverse_mercator, simplify_path
+from render_worker import MapRenderWorker
 
 
 class MapPolygon:
@@ -340,251 +341,6 @@ class MapDataLoader(QThread):
             self.progress_message.emit(f"Error loading map: {str(e)}")
 
 
-class IdleLabelWorker(QThread):
-    labels_computed = Signal(list)
-    
-    def __init__(self, road_candidates, river_candidates, area_candidates, place_candidates,
-                 main_drawn_ids, main_drawn_rects,
-                 center_x, center_y, scale, width, height):
-        super().__init__()
-        self.road_candidates = road_candidates
-        self.river_candidates = river_candidates
-        self.area_candidates = area_candidates
-        self.place_candidates = place_candidates
-        self.main_drawn_ids = main_drawn_ids
-        self.main_drawn_rects = list(main_drawn_rects)
-        self.center_x = center_x
-        self.center_y = center_y
-        self.scale = scale
-        self.width = width
-        self.height = height
-        
-    def to_screen(self, x, y):
-        px = self.width / 2.0 + (x - self.center_x) * self.scale
-        py = self.height / 2.0 - (y - self.center_y) * self.scale
-        return px, py
-
-    def run(self):
-        computed_labels = []
-        occupied_cells = set()
-        all_rects = list(self.main_drawn_rects)
-        
-        sc_x = self.width / 2.0
-        sc_y = self.height / 2.0
-        
-        # Helper to process a linear feature (road or river)
-        def process_linear_feature(candidates, label_type):
-            for feat in candidates:
-                if self.isInterruptionRequested():
-                    return False
-                    
-                name = feat["name"]
-                points = feat["points"]
-                if not points or len(points) < 2:
-                    continue
-                    
-                # Convert all points to screen space
-                screen_pts = [self.to_screen(pt[0], pt[1]) for pt in points]
-                
-                best_seg = None
-                min_dist_sq = float('inf')
-                
-                for i in range(len(screen_pts) - 1):
-                    p1 = screen_pts[i]
-                    p2 = screen_pts[i+1]
-                    
-                    # Check if segment's midpoint is on screen
-                    mx = (p1[0] + p2[0]) / 2.0
-                    my = (p1[1] + p2[1]) / 2.0
-                    
-                    if 0 <= mx <= self.width and 0 <= my <= self.height:
-                        dx = mx - sc_x
-                        dy = my - sc_y
-                        dist_sq = dx * dx + dy * dy
-                        if dist_sq < min_dist_sq:
-                            min_dist_sq = dist_sq
-                            best_seg = (p1, p2, mx, my)
-                            
-                if not best_seg:
-                    continue
-                    
-                p1, p2, mx, my = best_seg
-                
-                # Density check (80x80 pixels cell)
-                cell = (int(mx / 80), int(my / 80))
-                if cell in occupied_cells:
-                    continue
-                    
-                # Angle check
-                dx_s = p2[0] - p1[0]
-                dy_s = p2[1] - p1[1]
-                if dx_s == 0 and dy_s == 0:
-                    continue
-                    
-                angle_rad = math.atan2(dy_s, dx_s)
-                angle_deg = math.degrees(angle_rad)
-                
-                # Normalize to [-90, 90] degrees
-                if angle_deg > 90:
-                    angle_deg -= 180
-                elif angle_deg < -90:
-                    angle_deg += 180
-                    
-                rtype = feat.get("road_type")
-                if rtype:
-                    font_sizes = {
-                        'motorway': 9.0,
-                        'trunk': 8.0,
-                        'primary': 8.0,
-                        'secondary': 7.0,
-                        'tertiary': 7.0,
-                        'unclassified': 6.0,
-                        'residential': 6.0
-                    }
-                    fsize = font_sizes.get(rtype, 6.0)
-                else:
-                    fsize = 7.0 # Default for rivers
-                w = len(name) * (fsize * 0.7) + 4
-                h = fsize + 2.0
-                
-                # Calculate AABB
-                rad = math.radians(angle_deg)
-                cos_a = math.cos(rad)
-                sin_a = math.sin(rad)
-                hw = w / 2.0
-                hh = h / 2.0
-                
-                corners = [
-                    (-hw, -hh),
-                    (hw, -hh),
-                    (-hw, hh),
-                    (hw, hh)
-                ]
-                xs = []
-                ys = []
-                for cx, cy in corners:
-                    rx = cx * cos_a - cy * sin_a
-                    ry = cx * sin_a + cy * cos_a
-                    xs.append(mx + rx)
-                    ys.append(my + ry)
-                    
-                aabb = QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
-                
-                # Intersection collision
-                collision = False
-                for r in all_rects:
-                    if r.intersects(aabb):
-                        collision = True
-                        break
-                        
-                if not collision:
-                    computed_labels.append({
-                        "type": label_type,
-                        "text": name,
-                        "x": mx,
-                        "y": my,
-                        "angle": angle_deg,
-                        "rect": aabb,
-                        "road_type": rtype
-                    })
-                    occupied_cells.add(cell)
-                    all_rects.append(aabb)
-            return True
-
-        # 1. Prioritize roads/streets (focus)
-        if not process_linear_feature(self.road_candidates, "road"):
-            return
-            
-        # 2. Rivers
-        if not process_linear_feature(self.river_candidates, "river"):
-            return
-            
-        # 3. Places (villages, towns)
-        for place in self.place_candidates:
-            if self.isInterruptionRequested():
-                return
-                
-            if place["id"] in self.main_drawn_ids:
-                continue
-                
-            px, py = self.to_screen(place["x"], place["y"])
-            
-            cell = (int(px / 80), int(py / 80))
-            if cell in occupied_cells:
-                continue
-                
-            ptype = place["place_type"]
-            font_size = 11 if ptype == "city" else (9 if ptype == "town" else 8)
-            w = len(place["name"]) * (font_size * 0.55) + 4
-            h = font_size + 4
-            
-            label_rect = QRectF(px + 6, py - h / 2.0, w, h)
-            
-            collision = False
-            for r in all_rects:
-                if r.intersects(label_rect):
-                    collision = True
-                    break
-                    
-            if not collision:
-                computed_labels.append({
-                    "type": "place",
-                    "text": place["name"],
-                    "x": px,
-                    "y": py,
-                    "angle": 0.0,
-                    "place_type": ptype,
-                    "rect": label_rect
-                })
-                occupied_cells.add(cell)
-                all_rects.append(label_rect)
-                
-        # 4. Areas (waterbodies, forests, wetlands)
-        for area in self.area_candidates:
-            if self.isInterruptionRequested():
-                return
-                
-            cx = (area["min_x"] + area["max_x"]) / 2.0
-            cy = (area["min_y"] + area["max_y"]) / 2.0
-            
-            px, py = self.to_screen(cx, cy)
-            
-            # Check center on screen
-            if not (0 <= px <= self.width and 0 <= py <= self.height):
-                continue
-                
-            cell = (int(px / 80), int(py / 80))
-            if cell in occupied_cells:
-                continue
-                
-            name = area["name"]
-            w = len(name) * 5.0 + 4
-            h = 9.0
-            
-            label_rect = QRectF(px - w / 2.0, py - h / 2.0, w, h)
-            
-            collision = False
-            for r in all_rects:
-                if r.intersects(label_rect):
-                    collision = True
-                    break
-                    
-            if not collision:
-                computed_labels.append({
-                    "type": "area",
-                    "text": name,
-                    "x": px,
-                    "y": py,
-                    "angle": 0.0,
-                    "area_type": area["area_type"],
-                    "rect": label_rect
-                })
-                occupied_cells.add(cell)
-                all_rects.append(label_rect)
-                
-        if not self.isInterruptionRequested():
-            self.labels_computed.emit(computed_labels)
-
 
 class MapWidget(QWidget):
     """
@@ -611,26 +367,21 @@ class MapWidget(QWidget):
         self.dragging = False         # True when user is left-click dragging the map
         self.last_mouse_pos = QPoint()
         
-        # Progressive Rendering & Activity Timer states.
-        # To avoid GUI thread freezes, self.is_interacting limits features painted 
-        # during dynamic actions. Once movement stops, the timer fires end_interaction
-        # to render full details.
+        # Off-Screen Background Image Rendering States
         self.is_interacting = False
         self.rendering_in_progress = False
-        self.is_rendering_detailed = False  # Track if full detailed render is active
-        self.interaction_timer = QTimer(self)
-        self.interaction_timer.setSingleShot(True)
-        self.interaction_timer.timeout.connect(self.end_interaction)
+        self.map_image = None
+        self.image_center_x = 0.0
+        self.image_center_y = 0.0
+        self.image_scale = 1.0
+        self.image_w = 0
+        self.image_h = 0
+        self.render_worker = None
         
-        # Idle Label Thread fields
-        self.idle_timer = QTimer(self)
-        self.idle_timer.setSingleShot(True)
-        self.idle_timer.timeout.connect(self.start_idle_label_worker)
-        
-        self.idle_worker = None
-        self.idle_labels = []
-        self.main_drawn_rects = []
-        self.main_drawn_places = set()
+        # Debounce timer for triggering background rendering when panning/zooming stops
+        self.render_debounce_timer = QTimer(self)
+        self.render_debounce_timer.setSingleShot(True)
+        self.render_debounce_timer.timeout.connect(self.trigger_background_render)
         
         # Spatial Indexes & geometries loaded from thread
         self.data_loaded = False
@@ -863,9 +614,7 @@ class MapWidget(QWidget):
             self.center_y = saved_vp["center_y"]
             self.scale = saved_vp["scale"]
             self.constrain_view()
-            self.update()
-            # Start the background label thread after initial rendering
-            self.idle_timer.start(100)
+            self.start_interaction()
         else:
             self.fit_to_bbox(self.global_bbox)
         
@@ -1075,172 +824,79 @@ class MapWidget(QWidget):
             lod = self.get_details_for_scale(self.scale)["roads"]
         return rules.get_road_width_for_scale(road_type, self.scale, self.is_interacting, lod, ignore_interaction)
 
-    # Progressive Detail Rendering States
-    def stop_idle_label_worker(self):
+    # Asynchronous Off-Screen Rendering Methods
+    def abort_rendering(self):
         """
-        Cancels the idle timer and requests interruption of the worker thread.
+        Cancels the debounce timer and requests interruption of the worker thread.
         Blocks until the thread is fully joined to guarantee clean shutdown.
         """
-        if hasattr(self, "idle_timer") and self.idle_timer.isActive():
-            self.idle_timer.stop()
+        if hasattr(self, "render_debounce_timer") and self.render_debounce_timer.isActive():
+            self.render_debounce_timer.stop()
             
-        if hasattr(self, "idle_worker") and self.idle_worker and self.idle_worker.isRunning():
-            self.idle_worker.requestInterruption()
-            self.idle_worker.wait() # Block until thread exits (should be <1ms due to quick checks)
-            self.idle_worker = None
+        if hasattr(self, "render_worker") and self.render_worker and self.render_worker.isRunning():
+            self.render_worker.requestInterruption()
+            self.render_worker.wait()
+            self.render_worker = None
             
-        self.idle_labels = []
+        self.rendering_in_progress = False
 
-    def start_idle_label_worker(self):
+    def trigger_background_render(self):
         """
-        Gathers road and place label candidates, filters them, and kicks off
-        the background IdleLabelWorker QThread.
+        Launches the background MapRenderWorker thread to render the map asynchronously.
         """
-        if not self.data_loaded or self.is_interacting:
+        if not self.data_loaded:
             return
             
-        if hasattr(self, "idle_worker") and self.idle_worker and self.idle_worker.isRunning():
-            self.idle_worker.requestInterruption()
-            self.idle_worker.wait()
-            
-        # Get active viewport bounding rect in Web Mercator meters
-        vx1, vy2 = self.to_mercator(0, 0)
-        vx2, vy1 = self.to_mercator(self.width(), self.height())
-        viewport_rect = QRectF(vx1, vy1, vx2 - vx1, vy2 - vy1)
+        self.abort_rendering()
         
-        # Resolve simplification scale key
-        sim_key = None
-        for k in sorted(self.zoom_details.keys(), key=float):
-            if float(k) <= self.scale:
-                sim_key = k
-            else:
-                break
-        if sim_key is None:
-            sim_key = "0.0001"
-            
-        # Extract candidate roads (streets names focus)
-        road_candidates = []
-        road_types = rules.ROAD_CATEGORIES
-        for rtype in road_types:
-            width = self.get_road_width(rtype, ignore_interaction=True)
-            if width > 0.0:
-                visible_roads = self.roads_index[sim_key][rtype].query(viewport_rect)
-                for item in visible_roads:
-                    if item.name:
-                        points = [(pt.x(), pt.y()) for pt in item.polygon]
-                        road_candidates.append({
-                            "name": item.name,
-                            "points": points,
-                            "road_type": rtype
-                        })
-                        
-        # Extract candidate rivers
-        river_candidates = []
-        visible_rivers = self.rivers_index[sim_key].query(viewport_rect)
-        for item in visible_rivers:
-            if item.name:
-                points = [(pt.x(), pt.y()) for pt in item.polygon]
-                river_candidates.append({
-                    "name": item.name,
-                    "points": points
-                })
-                
-        # Extract candidate areas (waterbodies, forests, wetlands)
-        area_candidates = []
-        # Waterbodies
-        visible_water = self.waterbodies_index[sim_key].query(viewport_rect)
-        for item in visible_water:
-            if item.name:
-                area_candidates.append({
-                    "name": item.name,
-                    "min_x": item.min_x,
-                    "min_y": item.min_y,
-                    "max_x": item.max_x,
-                    "max_y": item.max_y,
-                    "area_type": "waterbody"
-                })
-        # Forests
-        visible_forests = self.forests_index[sim_key].query(viewport_rect)
-        for item in visible_forests:
-            if item.name:
-                area_candidates.append({
-                    "name": item.name,
-                    "min_x": item.min_x,
-                    "min_y": item.min_y,
-                    "max_x": item.max_x,
-                    "max_y": item.max_y,
-                    "area_type": "forest"
-                })
-        # Wetlands
-        visible_wetlands = self.wetlands_index[sim_key].query(viewport_rect)
-        for item in visible_wetlands:
-            if item.name:
-                area_candidates.append({
-                    "name": item.name,
-                    "min_x": item.min_x,
-                    "min_y": item.min_y,
-                    "max_x": item.max_x,
-                    "max_y": item.max_y,
-                    "area_type": "wetland"
-                })
-                        
-        # Extract candidate places
-        place_candidates = []
-        for place in self.places:
-            if viewport_rect.contains(QPointF(place["x"], place["y"])):
-                place_candidates.append(place)
-                
-        main_drawn_ids = getattr(self, "main_drawn_places", set())
-        main_drawn_rects = getattr(self, "main_drawn_rects", [])
+        # Collect data structures to pass to background thread
+        map_data = {
+            "places": self.places,
+            "coastlines_index": self.coastlines_index,
+            "wetlands_index": self.wetlands_index,
+            "forests_index": self.forests_index,
+            "waterbodies_index": self.waterbodies_index,
+            "rivers_index": self.rivers_index,
+            "roads_index": self.roads_index
+        }
         
-        self.idle_worker = IdleLabelWorker(
-            road_candidates,
-            river_candidates,
-            area_candidates,
-            place_candidates,
-            main_drawn_ids,
-            main_drawn_rects,
-            self.center_x,
-            self.center_y,
-            self.scale,
-            self.width(),
-            self.height()
+        self.render_worker = MapRenderWorker(
+            self.width(), self.height(),
+            self.center_x, self.center_y, self.scale,
+            map_data, self.zoom_details, self.colors,
+            self.frame_budget
         )
-        self.idle_worker.labels_computed.connect(self.on_idle_labels_computed)
-        self.idle_worker.start()
+        self.render_worker.render_completed.connect(self.on_render_completed)
+        self.rendering_in_progress = True
+        self.render_worker.start()
+        self.update()
 
-    def on_idle_labels_computed(self, labels):
+    def on_render_completed(self, img):
         """
-        Slot received when the background label computation finishes.
+        Slot triggered when the background QImage rendering is complete.
+        Saves the new image and triggers a screen refresh.
         """
-        self.idle_labels = labels
+        self.map_image = img
+        self.image_center_x = self.center_x
+        self.image_center_y = self.center_y
+        self.image_scale = self.scale
+        self.image_w = self.width()
+        self.image_h = self.height()
+        
+        self.is_interacting = False
+        self.rendering_in_progress = False
+        self.save_settings()
         self.update()
 
     def start_interaction(self):
         """
-        Triggers instant rendering mode. Skips heavy features and starts
-        a 250ms timer to restore complete details once user input ceases.
+        Triggers interactive transform mode. Stretches/translates the current image,
+        and starts a 150ms timer to launch a fresh background render once user input halts.
         """
-        self.stop_idle_label_worker() # Cancel and block background thread
-        
         self.is_interacting = True
-        self.rendering_in_progress = True
-        self.interaction_timer.start(250) # Redraw full details 250ms after activity stops
+        self.render_debounce_timer.start(150)
         self.update()
-        
-    def end_interaction(self):
-        """
-        Triggered when user interaction halts. Redraws all layers in full resolution and persists viewport location.
-        """
-        self.is_interacting = False
-        self.rendering_in_progress = False
-        self.is_rendering_detailed = True  # Block interactions during the detailed paint
-        self.save_settings()
-        self.update()
-        
-        # Schedule the idle label background worker thread to run in 100ms
-        self.idle_timer.start(100)
-        
+
     def clear_rendering_indicator(self):
         """
         Failsafe method to force clearing the overlay.
@@ -1443,17 +1099,55 @@ class MapWidget(QWidget):
     def paintEvent(self, event):
         """
         Main drawing method executed on every repaint request.
-        Delegates vector geometry rendering to renderer.paint_map.
+        Translates and scales the pre-rendered map image during active panning/zooming.
         """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        renderer.paint_map(painter, self)
-
-    def reset_rendering_detailed(self):
-        """
-        Resets the detailed rendering lock flag.
-        """
-        self.is_rendering_detailed = False
+        
+        if not self.data_loaded:
+            painter.setFont(QFont("Segoe UI", 14))
+            painter.setPen(QColor("#5D6D7E"))
+            if hasattr(self, "db_name") and self.db_name:
+                painter.drawText(self.rect(), Qt.AlignCenter, constants.STR_LOADING_DATA)
+            else:
+                painter.drawText(self.rect(), Qt.AlignCenter, constants.STR_NO_MAP_PROMPT)
+            return
+            
+        # Draw pre-rendered map image
+        if self.map_image:
+            painter.save()
+            # Center of the screen coordinate system
+            painter.translate(self.width() / 2.0, self.height() / 2.0)
+            
+            # Compute zoom scale ratio relative to the pre-rendered image
+            s_ratio = self.scale / self.image_scale
+            painter.scale(s_ratio, s_ratio)
+            
+            # Calculate pixel translation vector based on camera center delta
+            dx = (self.image_center_x - self.center_x) * self.image_scale
+            dy = -(self.image_center_y - self.center_y) * self.image_scale
+            painter.translate(dx, dy)
+            
+            # Align drawing starting offset to draw image centered
+            painter.translate(-self.image_w / 2.0, -self.image_h / 2.0)
+            painter.drawImage(0, 0, self.map_image)
+            painter.restore()
+            
+        # Draw "Rendering..." overlay if background thread is active
+        if hasattr(self, "render_worker") and self.render_worker and self.render_worker.isRunning():
+            painter.save()
+            margin_right = 20
+            margin_top = 20
+            indicator_w = 120
+            indicator_h = 30
+            rect = QRectF(self.width() - indicator_w - margin_right, margin_top, indicator_w, indicator_h)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(44, 62, 80, 200)))
+            painter.drawRoundedRect(rect, 15, 15)
+            painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            painter.setPen(QColor("#FFFFFF"))
+            painter.drawText(rect, Qt.AlignCenter, "⏳ RENDERING...")
+            painter.restore()
 import preprocess
 
 class PreprocessorWorker(QThread):
@@ -1745,7 +1439,7 @@ class MainWindow(QMainWindow):
             self.loader.terminate()
             self.loader.wait()
             
-        self.map_widget.stop_idle_label_worker()
+        self.map_widget.abort_rendering()
         
         self.map_widget.data_loaded = False
         self.map_widget.update()
