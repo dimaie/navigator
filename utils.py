@@ -96,31 +96,36 @@ def simplify_path(points, epsilon):
 def stitch_node_loops(ways):
     """
     Connects linear segments that share endpoint nodes into continuous loops or longer lines.
+    Optimized to run in O(N) time using set-based active path lookups.
     """
     paths = [list(w) for w in ways if len(w) > 1]
     closed_loops = []
     open_paths = []
     
+    # Store set of active path object IDs for O(1) membership checking and removal
+    active_ids = set(id(p) for p in paths)
+    
+    # Map node -> list of active path objects
     node_to_paths = {}
     for p in paths:
         node_to_paths.setdefault(p[0], []).append(p)
         node_to_paths.setdefault(p[-1], []).append(p)
         
-    while paths:
-        curr = paths.pop(0)
-        if curr[0] == curr[-1] and len(curr) > 1:
-            closed_loops.append(curr)
+    for p in paths:
+        if id(p) not in active_ids:
             continue
-            
+        active_ids.remove(id(p))
+        
+        curr = p
         extended = True
         while extended:
             extended = False
             for node, check_idx in [(curr[-1], -1), (curr[0], 0)]:
                 candidates = node_to_paths.get(node, [])
-                candidates = [c for c in candidates if c is not curr and c in paths]
-                if candidates:
-                    other = candidates[0]
-                    paths.remove(other)
+                active_candidates = [c for c in candidates if id(c) in active_ids]
+                if active_candidates:
+                    other = active_candidates[0]
+                    active_ids.remove(id(other))
                     
                     if check_idx == -1:
                         if curr[-1] == other[0]:
