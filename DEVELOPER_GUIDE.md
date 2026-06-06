@@ -1,6 +1,7 @@
 # Developer & Implementation Guide: Offline Map Viewer
 
-This guide explains the architecture, database formats, domain-specific concepts, and codebase details of the Offline Map Viewer project. It is written to be sufficient for a junior programmer or AI assistant to understand, maintain, and extend the application.
+> [!IMPORTANT]
+> **Documentation Synchronization Notice**: This developer guide must be kept in sync with the codebase. Whenever you make modifications to styling rules, preprocessing pipelines, database schemas, spatial grid indexes, search systems, or rendering processes, update this document accordingly.
 
 ---
 
@@ -46,6 +47,18 @@ These coordinates are computed using functions in [utils.py](file:///c:/Work/Map
 OSM files store ways as disconnected, random segments. To render long continuous roads, rivers, or railways without visual gaps and enable clean text labeling, we connect matching endpoints.
 *   **Method**: `stitch_node_loops(node_lists)` (in [utils.py](file:///c:/Work/Maps/utils.py)) takes a list of lists of node IDs, finds segments that share start/end node IDs, and merges them into continuous paths.
 
+### D. OpenStreetMap PBF Data Format
+The `.osm.pbf` file format is a highly compressed binary representation of OSM data using Google Protocol Buffers. It is organized into independent blocks:
+*   **HeaderBlock**: Metadata about the file (boundaries, software, required parser features).
+*   **PrimitiveBlock**: Contains actual geographical elements (Nodes, Ways, Relations) and is structured to optimize storage space:
+    *   **StringTable**: An array of strings used inside the block. Keys, values, and usernames are stored once and referenced by a 0-based index to prevent duplicate string storage.
+    *   **DenseNodes**: Nodes are grouped and compressed using **delta encoding**. Rather than absolute coordinate values (which require many bytes), the format stores differences between consecutive node IDs and coordinates:
+        *   $$\Delta x_i = x_i - x_{i-1}$$
+        *   $$\Delta y_i = y_i - y_{i-1}$$
+        This saves a significant amount of bytes since neighboring nodes have small relative differences. Coordinates are also scaled to 64-bit integers.
+    *   **Ways & Relations**: Stored as lists of node references or member IDs, which also utilize delta encoding.
+*   **Parsing in Python**: Read iteratively using the `osmiter` library. In this project, `osmiter` is used to stream elements block-by-block to keep memory usage low. In addition to parsing `.osm.pbf` and `.osm` (XML) files, `osmiter` supports reading from custom file-like objects. We leverage this feature by wrapping the raw file stream in a custom `ProgressFileWrapper` object, which intercepts reads to calculate and report real-time parsing progress (0-100%) to the GUI.
+
 ---
 
 ## 3. Database Schema
@@ -75,52 +88,85 @@ Stores metadata keys (e.g., `"bbox"` containing the global map bounding box in J
 
 ---
 
-## 4. Codebase Deep Dive (File-by-File)
+## 4. Search & Autocomplete Architecture
 
-### A. [rules.py](file:///c:/Work/Maps/rules.py)
-Defines categorization whitelists and style constraints.
-*   `ROAD_CATEGORIES`: An ordered list mapping road types from major to minor (`'motorway'` to `'cycleway'`).
-*   `get_road_width_for_scale(road_type, scale, is_interacting, lod_roads_threshold)`: Calculates screen pixel widths for roads depending on the zoom scale and interaction status.
-*   `get_place_font_style(place_type)`: Returns font size and bold flags (e.g. counties render at `10pt, bold`).
-*   `get_place_marker_style(place_type)`: Returns the dot marker size and color (e.g. county labels return `0.0` dot size to disable point dots).
+The viewer includes an incremental autocomplete search feature that queries places, Eircodes (postcodes), and named road/waterway features.
 
-### B. [constants.py](file:///c:/Work/Maps/constants.py)
-Stores default configurations:
-*   `DEFAULT_COLORS`: Light-mode color hex strings for ocean (`#D4E6F1`), land (`#FCFAF2`), railways (`#566573`), country boundaries (`#8E44AD`), and county boundaries (`#C39BD3`).
-*   `DEFAULT_ZOOM_DETAILS`: Level of Detail (LOD) thresholds mapping zoom scale keys to:
-    *   `roads`: The maximum index in `ROAD_CATEGORIES` that should be visible.
-    *   `places`: The minimum population threshold to display a label.
-    *   `simplification`: The Douglas-Peucker simplification tolerance in meters (large scales simplify geometries to optimize frame rates).
+### A. Autocomplete Index Construction
+In `MapDataLoader.run()`, we construct a sorted list of name-to-description tuples (`search_items`) for autocomplete:
+1.  **Places**: Loops over loaded cities, towns, and villages. If a county is associated with it, we construct a description: `"Name, Co. County"`.
+2.  **Postcodes**: Loops over unique Eircodes in the `postcodes` table and yields `"Postcode (Postcode)"`.
+3.  **Ways**: Selects all named road/river features. To provide context, we perform a **spatial grid proximity search** to find the nearest city/town in memory, producing a description like `"Road Name, City Name, Co. County"`.
+4.  **Autocompletion Dispatch**: The list is sorted alphabetically and loaded into a `QCompleter` attached to the GUI search box.
 
-### C. [preprocess.py](file:///c:/Work/Maps/preprocess.py)
-A pipeline that rebuilds the SQLite database from `.osm.pbf`:
-1.  **Pass 1**: Scans PBF elements sequentially. It inserts all nodes, ways, and relations into raw tables. It collects whitelisted roads, rivers, and railways in memory.
-2.  **Boundary Extraction**: Queries relation boundaries of admin levels 2, 4, 6. It resolves their member way IDs, collects their node lists, and registers them in the `kept_ways` list.
-3.  **Stitching**: Runs `stitch_node_loops` on the collected road, railway, and river segments to assemble them into long continuous lines.
-4.  **Pass 2**: Resolves coordinate coordinates (X, Y) from PBF nodes for all node IDs listed in `needed_nodes` (any node referenced by a kept way).
-5.  **Save & Index**: Computes county centroids from boundary relations, writes places and ways into final SQLite tables, and builds SQLite indices on bounds (`idx_ways_bbox`) and features (`idx_ways_type`).
-
-### D. [viewer.py](file:///c:/Work/Maps/viewer.py)
-The PySide6 interface that manages the map display:
-*   `SpatialGridIndex`: Splits the map bounds into a grid. Geometries are placed in cells overlapping their bounding box. During viewport rendering, only items from grid cells overlapping the screen are queried, reducing checks to $O(1)$.
-*   `MapDataLoader (QThread)`: Asynchronously queries the SQLite database, loads coordinates from blobs, constructs `QPolygonF` geometries, simplifies them using `simplify_path`, and populates the `SpatialGridIndex` for each scale.
-*   `MapWidget`: Handles mouse events for panning (dragging the cursor) and zooming (mouse wheel).
-    *   `trigger_background_render()`: Packages spatial indexes and settings into `map_data` and runs the background thread.
-
-### E. [renderer.py](file:///c:/Work/Maps/renderer.py)
-Calculates geometry rendering on an off-screen `QImage` canvas:
-1.  **Coordinate Budgeting**: To prevent frame drops during heavy rendering, it calculates the total point count of visible features. If it exceeds the CPU capacity budget, it dynamically falls back to simplified geometries (coarser scale keys) until it fits the budget.
-2.  **Viewport Matrix Transformation**: Uses standard painter matrix transformations to translate and scale Web Mercator coordinates directly to screen pixels.
-3.  **Drawing Order**:
-    *   Land mass (from coastline loops) -> Forest polygons -> Wetland polygons -> Waterbody polygons.
-    *   Rivers -> Administrative boundaries (country as dot-dash plum lines, counties as dashed purple lines).
-    *   Railways (drawn twice: a base solid slate-grey line, and a top dashed light line to simulate tracks).
-    *   Road casings -> Road cores (minor paths bypass casing drawing and render as dashed lines).
-    *   Place labels (utilizes a collision grid to prevent overlapping labels; county labels render as border-colored text at their calculated centroids without point dots or backgrounds).
+### B. Viewport Centering & Scale Allocation
+When the user submits a search string, `search_place()` handles positioning in three steps:
+1.  **Postcode Parsing**: Standardizes search queries (removes spaces, converts to uppercase).
+    *   Queries `postcodes` for an exact match. If found, centers on it and zooms close (`scale = 0.1`).
+    *   If no exact match exists, checks if it is a 7-character Eircode (e.g. `R32CH9D`), extracts the 3-character routing key prefix (e.g. `R32`), and averages the coordinates of all matching Eircode prefixes in the database.
+2.  **Place Name Scoping**:
+    *   Extracts base name and matches against loaded places. If county info is provided in the query (split by comma), filters for the matching county.
+    *   Sets camera center to the place coordinate. Adjusts scale according to type: cities zoom out (`0.05`), towns zoom closer (`0.1`), villages zoom very close (`0.25`).
+3.  **Proximity Sorting on Named Features**:
+    *   If query matches a way, reads up to 200 matching ways from SQLite.
+    *   Resolves a reference coordinate to sort candidates: if the search input included a town name (e.g. `Dublin Road, Athlone`), looks up the town's centroid; otherwise, uses the current viewport center.
+    *   Calculates squared Euclidean distance from each way's centroid to this reference point and sorts.
+    *   Centers the camera on the closest way and dynamically adjusts the zoom scale to fit the way's bounding box:
+        $$\text{fit\_scale} = \frac{\min(\text{Viewport Width}, \text{Viewport Height})}{\max(\text{Way Width}, \text{Way Height})}$$
 
 ---
 
-## 5. Guide to Extending the App
+## 5. Major Functions Deep Dive
+
+### A. Preprocessing (`preprocess.py`: `run_preprocess`)
+This function builds the optimized DB from the source PBF.
+1.  **PRAGMA settings**: Connects to SQLite and turns off synchronous writes (`PRAGMA synchronous=OFF`) and WAL journaling (`PRAGMA journal_mode=WAL`) to accelerate bulk insertions.
+2.  **Pass 1 Scan**: Iterates through PBF nodes, ways, and relations.
+    *   Nodes: Bulk-inserts places (city/town/village) into memory and stores raw coordinates in `raw_nodes`.
+    *   Ways: Checks if the tags contain whitelisted keys (coastlines, highways, railways, rivers, wetlands, forests, lakes). If so, adds node IDs to `needed_nodes` and stores segments.
+    *   Relations: Bulk-inserts members into `raw_relations`.
+3.  **Boundary extraction**: Queries the committed `raw_relations` table for administrative boundaries (levels 2, 4, 6). Collects their member way IDs, reads their node lists, adds the nodes to `needed_nodes`, and adds the boundary segments to `kept_ways`.
+4.  **Loop Stitching**: Runs `stitch_node_loops` on highway, railway, and river lists in memory to connect raw segments into long continuous lines.
+5.  **Pass 2 Scan**: Iterates through PBF nodes again. If a node's ID is in `needed_nodes`, projects its lat/lon into Mercator coordinates and saves it to a dictionary (`node_coords`).
+6.  **Database insertion**: Writes stitched geometries to the `ways` table. Converts coordinate float arrays into binary double-precision blobs (`struct.pack` using `d` format) to reduce DB size and load latency.
+7.  **Centroids and Indexes**:
+    *   Calculates county centroids by averaging the coordinates of all boundary nodes and saves them in `places`.
+    *   Creates spatial SQLite indices (`CREATE INDEX`) on bounding boxes and feature types.
+
+### B. Off-Screen Canvas Rendering (`renderer.py`: `render_map`)
+Renders vector layers onto a `QImage` canvas.
+1.  **LOD Scaling Key**: Selects the scale key (e.g. `0.003` or `0.01`) that matches or is less than the current viewport scale.
+2.  **Viewport Spatial Query**: Computes the Mercator bounding box of the current screen view. Queries each spatial index grid to retrieve only the features that overlap the viewport.
+3.  **Coordinate Budgeting**: Counts the total vertex count of visible items. If it exceeds the CPU capacity benchmark budget, drops down to a coarser scale key (with higher simplification tolerance) iteratively until the total point count fits the budget.
+4.  **Drawing Pipeline**:
+    *   Matrix transformation: Translates coordinates by `width/2` and `height/2` to center the camera, and scales by `scale` and `-scale` (since screen Y goes down but Mercator Y goes up).
+    *   Renders polygons: Coastlines (land mass), forests, wetlands, and waterbodies.
+    *   Renders lines: Rivers, administrative boundaries (uses custom pens with `Qt.DashDotLine` or `Qt.DashLine`), and railways (draws a solid grey base line, then a dashed light line on top to resemble tracks).
+    *   Renders roads: Skips casings for minor paths (`track`, `path`, etc.) and draws them with `Qt.DashLine`. Draws casings (width + 1.2px) for normal roads, followed by road cores.
+5.  **Text Labeling**: Runs a collision avoidance grid (split into 80x80px cells). Cities, towns, and county centroids are labeled. If a cell is unoccupied, the label is drawn and the cell is marked. Rotated labels are placed on linear roads/rivers by calculating segment angles.
+
+### C. Async Map Loader (`viewer.py`: `MapDataLoader.run`)
+Loads SQLite tables into memory during startup:
+1.  **Table verification**: Verifies tables exist, loads configuration bounds, and indexes Eircodes.
+2.  **Spatial index initialization**: Creates `SpatialGridIndex` grids for each of the 6 scale keys.
+3.  **Geometry Parsing**:
+    *   Queries ways, coastlines, waterbodies, bogs, forests, and roads.
+    *   Reads the binary coordinate `BLOB` from the database row, unpacks it using `array.array('d', blob)` for maximum conversion speed, and converts it to a `QPolygonF` object.
+    *   For each zoom scale, if simplification is enabled, simplifies geometry coordinates using the Douglas-Peucker algorithm and caches the simplified `QPolygonF`.
+    *   Adds geometries to the grid index cells matching their bounding box coordinates.
+4.  **Search Index**: Loops over places and ways to build the autocomplete lookup list, executing spatial nearest-neighbor searches to bind roads to towns.
+
+### D. Spatial Grid Index (`viewer.py`: `SpatialGridIndex`)
+A high-performance grid index that manages objects in 2D space.
+1.  **Initialization**: Divides the global bounding box of Ireland into a matrix of columns and rows (e.g. 24x24 for forests, 32x32 for roads). Each cell is initialized as an empty Python list.
+2.  **`add(item, min_x, min_y, max_x, max_y)`**: Calculates the column and row ranges that overlap the item's bounding box:
+    $$\text{col\_start} = \lfloor(min\_x - \text{grid\_min\_x}) / \text{cell\_width}\rfloor$$
+    Appends the item reference to all lists in this range.
+3.  **`query(viewport_rect)`**: Converts the screen coordinates back to grid column and row indices. Gathers and merges the lists of these cells into a Python `set` to eliminate duplicates, returning all visible candidate features in $O(1)$ cell lookups.
+
+---
+
+## 6. Guide to Extending the App
 
 ### A. How to Add a New Line/Polygon Feature (e.g., Powerlines)
 1.  **Update [rules.py](file:///c:/Work/Maps/rules.py)**: Create a helper function checking for the tag (e.g. `is_powerline(power)`).
