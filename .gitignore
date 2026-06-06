@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Databases and large data files (GitHub has a 100MB file limit)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.osm.pbf
+
+# Settings and local configs
+dev_settings.json
+.idea/
+.vscode/
