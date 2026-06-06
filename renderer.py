@@ -23,6 +23,15 @@ def to_screen(x, y, center_x, center_y, scale, width, height):
     py = height / 2.0 - (y - center_y) * scale
     return px, py
 
+def make_brush(color):
+    """
+    Safely creates a solid color QBrush to avoid PySide6 QGradient.Preset overload bugs.
+    """
+    brush = QBrush()
+    brush.setColor(color)
+    brush.setStyle(Qt.SolidPattern)
+    return brush
+
 def render_map(width, height, center_x, center_y, scale, map_data, zoom_details, colors, frame_budget, is_interruption_requested=None):
     """
     Renders the map (geometries, roads, rivers, labels) onto a QImage.
@@ -158,7 +167,7 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
     
     # Draw vector layers
     # Coastlines
-    land_brush = QBrush(color_land)
+    land_brush = make_brush(color_land)
     land_pen = QPen(color_land_border, 1.0)
     land_pen.setCosmetic(True)
     painter.setBrush(land_brush)
@@ -168,7 +177,7 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         painter.drawPolygon(poly)
         
     # Forests
-    forest_brush = QBrush(color_forest)
+    forest_brush = make_brush(color_forest)
     painter.setBrush(forest_brush)
     painter.setPen(Qt.NoPen)
     for item in visible_forests:
@@ -176,7 +185,7 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         painter.drawPolygon(poly)
         
     # Wetlands
-    wetland_brush = QBrush(color_wetland)
+    wetland_brush = make_brush(color_wetland)
     wetland_pen = QPen(color_wetland_border, 0.5)
     wetland_pen.setCosmetic(True)
     painter.setBrush(wetland_brush)
@@ -186,7 +195,7 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         painter.drawPolygon(poly)
         
     # Waterbodies
-    water_brush = QBrush(color_waterbody)
+    water_brush = make_brush(color_waterbody)
     water_pen = QPen(color_waterbody_border, 0.5)
     water_pen.setCosmetic(True)
     painter.setBrush(water_brush)
@@ -280,11 +289,11 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
             dot_size, dot_color_hex = rules.get_place_marker_style(ptype)
             dot_color = QColor(dot_color_hex)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(dot_color))
+            painter.setBrush(dot_color)
             painter.drawEllipse(QPointF(px, py), dot_size, dot_size)
             
             # semi-translucent background
-            painter.setBrush(QBrush(QColor(252, 250, 242, 210)))
+            painter.setBrush(QColor(252, 250, 242, 210))
             painter.drawRect(label_rect)
             
             # draw label text
@@ -438,7 +447,7 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
                 painter.rotate(angle_deg)
                 
                 rect = QRectF(-w / 2.0, -h / 2.0, w, h)
-                painter.setBrush(QBrush(QColor(252, 250, 242, 180 if rtype else 150)))
+                painter.setBrush(QColor(252, 250, 242, 180 if rtype else 150))
                 painter.setPen(Qt.NoPen)
                 painter.drawRect(rect)
                 
@@ -507,10 +516,10 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
             dot_size, dot_color_hex = rules.get_place_marker_style(ptype)
             dot_color = QColor(dot_color_hex)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(dot_color))
+            painter.setBrush(dot_color)
             painter.drawEllipse(QPointF(px, py), dot_size, dot_size)
             
-            painter.setBrush(QBrush(QColor(252, 250, 242, 210)))
+            painter.setBrush(QColor(252, 250, 242, 210))
             painter.drawRect(label_rect)
             
             font_size, font_bold = rules.get_place_font_style(ptype)
@@ -554,7 +563,7 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
             painter.translate(px, py)
             
             rect = QRectF(-w / 2.0, -h / 2.0, w, h)
-            painter.setBrush(QBrush(QColor(252, 250, 242, 150)))
+            painter.setBrush(QColor(252, 250, 242, 150))
             painter.setPen(Qt.NoPen)
             painter.drawRect(rect)
             

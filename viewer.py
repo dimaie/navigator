@@ -1142,7 +1142,7 @@ class MapWidget(QWidget):
             indicator_h = 30
             rect = QRectF(self.width() - indicator_w - margin_right, margin_top, indicator_w, indicator_h)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor(44, 62, 80, 200)))
+            painter.setBrush(QColor(44, 62, 80, 200))
             painter.drawRoundedRect(rect, 15, 15)
             painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
             painter.setPen(QColor("#FFFFFF"))
