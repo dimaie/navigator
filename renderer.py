@@ -215,8 +215,24 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         
     # Roads Outline (Casing)
     active_lod = zoom_details.get(active_sim_key, {}).get("roads", 1)
+    
+    # Diagnostic check for Athlone Services target road
+    target_x, target_y = -871624.79, 7057459.85
+    is_diag = viewport_rect.contains(QPointF(target_x, target_y))
+    if is_diag:
+        print(f"\n[DIAGNOSTIC] Viewport contains Athlone Services target point!")
+        print(f"  Current scale: {scale:.5f}, active_sim_key: {active_sim_key}, active_lod (threshold): {active_lod}")
+        
     for rtype in rules.ROAD_CATEGORIES:
         rlist = visible_roads.get(rtype, [])
+        if is_diag:
+            print(f"  Road type '{rtype}': queried {len(rlist)} visible features.")
+            for item in rlist:
+                if item.min_x - 50.0 <= target_x <= item.max_x + 50.0 and item.min_y - 50.0 <= target_y <= item.max_y + 50.0:
+                    width_px = rules.get_road_width_for_scale(rtype, scale, False, active_lod)
+                    print(f"    -> FOUND road in index covering target! Name: '{item.name or ''}', sub_type: '{item.sub_type}', bbox: [{item.min_x:.1f}, {item.min_y:.1f}, {item.max_x:.1f}, {item.max_y:.1f}]")
+                    print(f"       Width: {width_px} pixels")
+
         if not rlist:
             continue
         width_px = rules.get_road_width_for_scale(rtype, scale, False, active_lod)
