@@ -93,6 +93,7 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
     coastline_node_loops = []
     highways_map = {}
     rivers_map = {}
+    railways_map = {}
     
     if progress_callback:
         def cb1(pct):
@@ -161,6 +162,7 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
                     natural = tags.get("natural")
                     waterway = tags.get("waterway")
                     landuse = tags.get("landuse")
+                    railway = tags.get("railway")
                     
                     is_kept = False
                     feature_type = None
@@ -181,6 +183,11 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
                         else:
                             full_name = name
                         highways_map.setdefault((highway, full_name), []).append(way_nodes)
+                        for nid in way_nodes:
+                            needed_nodes.add(nid)
+                    elif railway in ('rail', 'tram', 'light_rail', 'subway', 'narrow_gauge', 'monorail'):
+                        name = tags.get("name", "")
+                        railways_map.setdefault((railway, name), []).append(way_nodes)
                         for nid in way_nodes:
                             needed_nodes.add(nid)
                     elif rules.is_river_canal(waterway):
@@ -224,6 +231,48 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
         if relations_batch:
             cursor.executemany("INSERT INTO raw_relations (id, members, tags) VALUES (?, ?, ?)", relations_batch)
         conn.commit()
+        
+        print("Extracting administrative boundaries from relations...")
+        cursor.execute("SELECT members, tags FROM raw_relations WHERE tags LIKE '%\"boundary\"%' AND tags LIKE '%\"administrative\"%'")
+        boundary_ways = {}
+        for members_json, tags_json in cursor.fetchall():
+            try:
+                tags = json.loads(tags_json)
+                if tags.get("boundary") == "administrative":
+                    admin_level = tags.get("admin_level")
+                    if admin_level in ("2", "4", "6"):
+                        members = json.loads(members_json)
+                        al = int(admin_level)
+                        for mtype, mref, mrole in members:
+                            if mtype == "way":
+                                if mref not in boundary_ways or al < int(boundary_ways[mref]):
+                                    boundary_ways[mref] = str(al)
+            except Exception as e:
+                pass
+
+        print(f"Found {len(boundary_ways)} boundary way segments of interest.")
+        
+        boundary_loaded = 0
+        for wid, al in boundary_ways.items():
+            cursor.execute("SELECT nodes, tags FROM raw_ways WHERE id = ?", (wid,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                nodes_blob, tags_json = row
+                num_nodes = len(nodes_blob) // 8
+                nd_ids = struct.unpack(f"<{num_nodes}q", nodes_blob)
+                tags = json.loads(tags_json) if tags_json else {}
+                name = tags.get("name", "")
+                kept_ways.append({
+                    "id": wid,
+                    "feature_type": "boundary",
+                    "sub_type": al,
+                    "name": name,
+                    "nodes": list(nd_ids)
+                })
+                for nid in nd_ids:
+                    needed_nodes.add(nid)
+                boundary_loaded += 1
+        print(f"Loaded {boundary_loaded} boundary way segments into kept_ways.")
     finally:
         if pbf_file:
             pbf_file.close()
@@ -245,6 +294,22 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
             })
             stitched_highways += 1
     print(f"Stitched {stitched_highways} highway paths from raw segments.")
+    
+    if progress_callback:
+        progress_callback(45, "Stitching railway networks...")
+    print("Stitching railways...")
+    stitched_railways = 0
+    for (sub_type, name), node_lists in railways_map.items():
+        loops, open_paths = stitch_node_loops(node_lists)
+        for path in loops + open_paths:
+            kept_ways.append({
+                "feature_type": "railway",
+                "sub_type": sub_type,
+                "name": name,
+                "nodes": path
+            })
+            stitched_railways += 1
+    print(f"Stitched {stitched_railways} railway paths.")
     
     if progress_callback:
         progress_callback(45, "Stitching river networks...")
@@ -342,6 +407,45 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
             (p["id"], p["name"], p["place_type"], p["x"], p["y"], p["population"])
         )
         
+    # 1b. Save County Centroids as Places
+    print("Computing and saving county centroids...")
+    cursor.execute("SELECT id, tags, members FROM raw_relations WHERE tags LIKE '%\"boundary\"%' AND tags LIKE '%\"administrative\"%' AND tags LIKE '%\"admin_level\": \"6\"%'")
+    county_rows = cursor.fetchall()
+    county_idx = -1000
+    for rel_id, tags_json, members_json in county_rows:
+        try:
+            tags = json.loads(tags_json)
+            name = tags.get("name", "")
+            if name:
+                members = json.loads(members_json)
+                xs, ys = [], []
+                for mtype, mref, mrole in members:
+                    if mtype == "way":
+                        cursor.execute("SELECT nodes FROM raw_ways WHERE id=?", (mref,))
+                        row = cursor.fetchone()
+                        if row and row[0]:
+                            nodes_blob = row[0]
+                            num_nodes = len(nodes_blob) // 8
+                            nd_ids = struct.unpack(f"<{num_nodes}q", nodes_blob)
+                            for nid in nd_ids:
+                                cursor.execute("SELECT lat, lon FROM raw_nodes WHERE id=?", (nid,))
+                                node_row = cursor.fetchone()
+                                if node_row:
+                                    lat, lon = node_row
+                                    x, y = project_mercator(lat, lon)
+                                    xs.append(x)
+                                    ys.append(y)
+                if xs and ys:
+                    cx = sum(xs) / len(xs)
+                    cy = sum(ys) / len(ys)
+                    cursor.execute(
+                        "INSERT INTO places (id, name, place_type, x, y, population) VALUES (?, ?, ?, ?, ?, ?)",
+                        (county_idx, name, "county", cx, cy, 99999999)
+                    )
+                    county_idx -= 1
+        except Exception as e:
+            pass
+        
     # 2. Stitch and Save Coastlines
     if progress_callback:
         progress_callback(92, "Stitching and saving coastlines...")
@@ -421,6 +525,69 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
     cursor.execute("CREATE INDEX idx_ways_type ON ways (feature_type)")
     cursor.execute("CREATE INDEX idx_places_coords ON places (x, y)")
     cursor.execute("CREATE INDEX idx_raw_nodes_coords ON raw_nodes (lat, lon)")
+    
+    # 5. Extract and Index Postcodes/Eircodes
+    try:
+        if progress_callback:
+            progress_callback(99, "Extracting and indexing Eircodes...")
+        print("Extracting and indexing Eircodes...")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS postcodes (
+            postcode TEXT,
+            normalized_postcode TEXT PRIMARY KEY,
+            x REAL,
+            y REAL
+        )
+        """)
+        
+        postcode_data = {} # normalized_postcode -> (postcode, x, y)
+        
+        # Query all nodes with postcode from raw_nodes
+        cursor.execute("SELECT lat, lon, tags FROM raw_nodes WHERE tags LIKE '%postcode%'")
+        for lat, lon, tags_json in cursor.fetchall():
+            try:
+                tags = json.loads(tags_json)
+                pc = tags.get("addr:postcode") or tags.get("postal_code")
+                if pc:
+                    pc = pc.strip()
+                    norm_pc = pc.replace(" ", "").upper()
+                    if norm_pc and norm_pc not in postcode_data:
+                        x, y = project_mercator(lat, lon)
+                        postcode_data[norm_pc] = (pc, x, y)
+            except:
+                pass
+                
+        # Query all ways with postcode from raw_ways
+        cursor.execute("SELECT nodes, tags FROM raw_ways WHERE tags LIKE '%postcode%'")
+        for nodes_blob, tags_json in cursor.fetchall():
+            try:
+                tags = json.loads(tags_json)
+                pc = tags.get("addr:postcode") or tags.get("postal_code")
+                if pc:
+                    pc = pc.strip()
+                    norm_pc = pc.replace(" ", "").upper()
+                    if norm_pc and norm_pc not in postcode_data:
+                        num_nodes = len(nodes_blob) // 8
+                        node_ids = struct.unpack(f"<{num_nodes}q", nodes_blob)
+                        if node_ids:
+                            cursor.execute("SELECT lat, lon FROM raw_nodes WHERE id = ?", (node_ids[0],))
+                            node_row = cursor.fetchone()
+                            if node_row:
+                                lat, lon = node_row
+                                x, y = project_mercator(lat, lon)
+                                postcode_data[norm_pc] = (pc, x, y)
+            except:
+                pass
+                
+        if postcode_data:
+            cursor.executemany(
+                "INSERT OR IGNORE INTO postcodes (postcode, normalized_postcode, x, y) VALUES (?, ?, ?, ?)",
+                [(pc, npc, x, y) for npc, (pc, x, y) in postcode_data.items()]
+            )
+        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_postcodes_normalized ON postcodes (normalized_postcode)")
+    except Exception as e:
+        print("Postcode indexing skipped/failed (not an error):", e)
     
     conn.commit()
     conn.close()

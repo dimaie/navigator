@@ -32,6 +32,12 @@ def make_brush(color):
     brush.setStyle(Qt.SolidPattern)
     return brush
 
+def get_font_scale_multiplier(scale):
+    """
+    Computes a dynamic font scaling multiplier based on zoom scale, clamping between 1.0 and 1.6.
+    """
+    return 1.0 + max(0.0, min(0.6, math.log10(scale / 0.001) * 0.22))
+
 def render_map(width, height, center_x, center_y, scale, map_data, zoom_details, colors, frame_budget, is_interruption_requested=None):
     """
     Renders the map (geometries, roads, rivers, labels) onto a QImage.
@@ -86,6 +92,7 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
     current_details = zoom_details.get(sim_key, {})
     lod_roads_threshold = current_details.get("roads", 1)
     places_threshold = current_details.get("places", 50000)
+    font_scale = get_font_scale_multiplier(scale)
     
     # 5. Retrieve visible features from Spatial Index
     visible_coastlines = map_data["coastlines_index"][sim_key].query(viewport_rect)
@@ -93,6 +100,8 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
     visible_wetlands = map_data["wetlands_index"][sim_key].query(viewport_rect)
     visible_waterbodies = map_data["waterbodies_index"][sim_key].query(viewport_rect)
     visible_rivers = map_data["rivers_index"][sim_key].query(viewport_rect)
+    visible_railways = map_data["railways_index"][sim_key].query(viewport_rect) if "railways_index" in map_data else []
+    visible_boundaries = map_data["boundaries_index"][sim_key].query(viewport_rect) if "boundaries_index" in map_data else []
     
     visible_roads = {}
     for rtype in rules.ROAD_CATEGORIES:
@@ -113,6 +122,10 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
     total_points += sum(get_point_count(item, sim_key) for item in visible_wetlands)
     total_points += sum(get_point_count(item, sim_key) for item in visible_waterbodies)
     total_points += sum(get_point_count(item, sim_key) for item in visible_rivers)
+    if "railways_index" in map_data:
+        total_points += sum(get_point_count(item, sim_key) for item in visible_railways)
+    if "boundaries_index" in map_data:
+        total_points += sum(get_point_count(item, sim_key) for item in visible_boundaries)
     for rtype, rlist in visible_roads.items():
         total_points += sum(get_point_count(item, sim_key) for item in rlist)
         
@@ -129,6 +142,8 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         test_wetlands = map_data["wetlands_index"][test_key].query(viewport_rect)
         test_waterbodies = map_data["waterbodies_index"][test_key].query(viewport_rect)
         test_rivers = map_data["rivers_index"][test_key].query(viewport_rect)
+        test_railways = map_data["railways_index"][test_key].query(viewport_rect) if "railways_index" in map_data else []
+        test_boundaries = map_data["boundaries_index"][test_key].query(viewport_rect) if "boundaries_index" in map_data else []
         
         test_roads = {}
         test_lod = zoom_details.get(test_key, {}).get("roads", 1)
@@ -143,6 +158,11 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         test_total += sum(get_point_count(item, test_key) for item in test_wetlands)
         test_total += sum(get_point_count(item, test_key) for item in test_waterbodies)
         test_total += sum(get_point_count(item, test_key) for item in test_rivers)
+        if "railways_index" in map_data:
+            test_total += sum(get_point_count(item, test_key) for item in test_railways)
+        if "boundaries_index" in map_data:
+            test_total += sum(get_point_count(item, test_key) for item in test_boundaries)
+            
         for rtype, rlist in test_roads.items():
             test_total += sum(get_point_count(item, test_key) for item in rlist)
             
@@ -153,6 +173,8 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         visible_wetlands = test_wetlands
         visible_waterbodies = test_waterbodies
         visible_rivers = test_rivers
+        visible_railways = test_railways
+        visible_boundaries = test_boundaries
         visible_roads = test_roads
         
     if is_interruption_requested and is_interruption_requested():
@@ -213,25 +235,42 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         poly = item.simplified_polygons.get(active_sim_key, item.polygon) if item.simplified_polygons else item.polygon
         painter.drawPolyline(poly)
         
+    # Administrative Boundaries
+    if visible_boundaries:
+        painter.setBrush(Qt.NoBrush)
+        for item in visible_boundaries:
+            poly = item.simplified_polygons.get(active_sim_key, item.polygon) if item.simplified_polygons else item.polygon
+            if item.sub_type == '2':
+                # Country boundary: thicker plum/purple dot-dash line
+                pen = QPen(QColor(colors.get("boundary_country", "#8E44AD")), 1.5, Qt.DashDotLine)
+            else:
+                # County/provincial boundary: thinner dashed line
+                pen = QPen(QColor(colors.get("boundary_county", "#C39BD3")), 0.8, Qt.DashLine)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawPolyline(poly)
+
+    # Railways (double layered pen for distinct train track styling)
+    if visible_railways:
+        painter.setBrush(Qt.NoBrush)
+        rail_base_pen = QPen(QColor(colors.get("railway", "#566573")), 1.8, Qt.SolidLine)
+        rail_base_pen.setCosmetic(True)
+        rail_top_pen = QPen(QColor(colors.get("railway_dash", "#FCFAF2")), 1.0, Qt.DashLine)
+        rail_top_pen.setCosmetic(True)
+        for item in visible_railways:
+            poly = item.simplified_polygons.get(active_sim_key, item.polygon) if item.simplified_polygons else item.polygon
+            painter.setPen(rail_base_pen)
+            painter.drawPolyline(poly)
+            painter.setPen(rail_top_pen)
+            painter.drawPolyline(poly)
+        
     # Roads Outline (Casing)
     active_lod = zoom_details.get(active_sim_key, {}).get("roads", 1)
     
-    # Diagnostic check for Athlone Services target road
-    target_x, target_y = -871624.79, 7057459.85
-    is_diag = viewport_rect.contains(QPointF(target_x, target_y))
-    if is_diag:
-        print(f"\n[DIAGNOSTIC] Viewport contains Athlone Services target point!")
-        print(f"  Current scale: {scale:.5f}, active_sim_key: {active_sim_key}, active_lod (threshold): {active_lod}")
-        
     for rtype in rules.ROAD_CATEGORIES:
+        if rtype in ('track', 'path', 'footway', 'cycleway'):
+            continue  # Skip casing for minor paths/tracks
         rlist = visible_roads.get(rtype, [])
-        if is_diag:
-            print(f"  Road type '{rtype}': queried {len(rlist)} visible features.")
-            for item in rlist:
-                if item.min_x - 50.0 <= target_x <= item.max_x + 50.0 and item.min_y - 50.0 <= target_y <= item.max_y + 50.0:
-                    width_px = rules.get_road_width_for_scale(rtype, scale, False, active_lod)
-                    print(f"    -> FOUND road in index covering target! Name: '{item.name or ''}', sub_type: '{item.sub_type}', bbox: [{item.min_x:.1f}, {item.min_y:.1f}, {item.max_x:.1f}, {item.max_y:.1f}]")
-                    print(f"       Width: {width_px} pixels")
 
         if not rlist:
             continue
@@ -256,7 +295,8 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
         if width_px <= 0.0:
             continue
         color = road_colors.get(rtype, QColor("#FFFFFF"))
-        pen = QPen(color, width_px, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        style = Qt.DashLine if rtype in ('track', 'path', 'footway', 'cycleway') else Qt.SolidLine
+        pen = QPen(color, width_px, style, Qt.RoundCap, Qt.RoundJoin)
         pen.setCosmetic(True)
         painter.setPen(pen)
         for item in rlist:
@@ -276,17 +316,20 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
     
     # A. Draw primary places first
     for place in map_data["places"]:
-        if place["population"] < places_threshold:
+        ptype = place["place_type"]
+        if ptype == "county" and scale < 0.0008:
+            continue
+        if place["population"] < places_threshold and ptype != "county":
             continue
         if not viewport_rect.contains(QPointF(place["x"], place["y"])):
             continue
             
-        ptype = place["place_type"]
         px, py = to_screen(place["x"], place["y"], center_x, center_y, scale, width, height)
         
         font_size, font_bold = rules.get_place_font_style(ptype)
+        scaled_font_size = max(6, int(font_size * font_scale))
         font_weight = QFont.Bold if font_bold else QFont.Normal
-        font = QFont("Segoe UI", font_size, font_weight)
+        font = QFont("Segoe UI", scaled_font_size, font_weight)
         
         fm = QFontMetrics(font)
         name = place["name"]
@@ -303,18 +346,23 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
                 
         if not collision:
             dot_size, dot_color_hex = rules.get_place_marker_style(ptype)
-            dot_color = QColor(dot_color_hex)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(dot_color)
-            painter.drawEllipse(QPointF(px, py), dot_size, dot_size)
+            if dot_size > 0.0:
+                dot_color = QColor(dot_color_hex)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(dot_color)
+                painter.drawEllipse(QPointF(px, py), dot_size, dot_size)
             
             # semi-translucent background
-            painter.setBrush(QColor(252, 250, 242, 210))
-            painter.drawRect(label_rect)
+            if ptype != "county":
+                painter.setBrush(QColor(252, 250, 242, 210))
+                painter.drawRect(label_rect)
             
             # draw label text
             painter.setFont(font)
-            painter.setPen(QPen(QColor("#2C3E50")))
+            if ptype == "county":
+                painter.setPen(QPen(QColor(colors.get("boundary_country", "#8E44AD"))))
+            else:
+                painter.setPen(QPen(QColor("#2C3E50")))
             painter.drawText(label_rect.left() + 2, label_rect.top() + fm.ascent(), name)
             
             drawn_rects.append(label_rect)
@@ -431,8 +479,9 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
             else:
                 fsize = 7.0
                 
-            w = len(name) * (fsize * 0.7) + 4
-            h = fsize + 2.0
+            fsize_scaled = fsize * font_scale
+            w = len(name) * (fsize_scaled * 0.7) + 4
+            h = fsize_scaled + 2.0
             
             rad = math.radians(angle_deg)
             cos_a = math.cos(rad)
@@ -479,13 +528,15 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
                         'residential':  {"size": 6, "weight": QFont.Normal, "color": QColor("#7F8C8D")}
                     }
                     style = style_map.get(rtype, style_map['residential'])
-                    font = QFont("Segoe UI", style["size"], style["weight"])
+                    scaled_size = max(5, int(style["size"] * font_scale))
+                    font = QFont("Segoe UI", scaled_size, style["weight"])
                     font.setItalic(True)
                     painter.setFont(font)
                     painter.setPen(style["color"])
                 else:
                     # River label
-                    font = QFont("Segoe UI", 7)
+                    scaled_size = max(5, int(7 * font_scale))
+                    font = QFont("Segoe UI", scaled_size)
                     font.setItalic(True)
                     painter.setFont(font)
                     painter.setPen(QColor("#2980B9"))
@@ -518,8 +569,9 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
             
         ptype = place["place_type"]
         font_size = 11 if ptype == "city" else (9 if ptype == "town" else 8)
-        w = len(place["name"]) * (font_size * 0.55) + 4
-        h = font_size + 4
+        scaled_font_size = max(6, int(font_size * font_scale))
+        w = len(place["name"]) * (scaled_font_size * 0.55) + 4
+        h = scaled_font_size + 4
         
         label_rect = QRectF(px + 6, py - h / 2.0, w, h)
         collision = False
@@ -539,8 +591,9 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
             painter.drawRect(label_rect)
             
             font_size, font_bold = rules.get_place_font_style(ptype)
+            scaled_font_size = max(6, int(font_size * font_scale))
             font_weight = QFont.Bold if font_bold else QFont.Normal
-            painter.setFont(QFont("Segoe UI", font_size, font_weight))
+            painter.setFont(QFont("Segoe UI", scaled_font_size, font_weight))
             painter.setPen(QPen(QColor("#2C3E50")))
             painter.drawText(label_rect, Qt.AlignLeft | Qt.AlignVCenter, " " + place["name"])
             
@@ -564,8 +617,9 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
             continue
             
         name = area["name"]
-        w = len(name) * 5.0 + 4
-        h = 9.0
+        fsize = 7.0 * font_scale
+        w = len(name) * (fsize * 0.7) + 4
+        h = fsize + 2.0
         
         label_rect = QRectF(px - w / 2.0, py - h / 2.0, w, h)
         collision = False
@@ -591,7 +645,8 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
             else:
                 color = QColor("#795548")
                 
-            font = QFont("Segoe UI", 7)
+            scaled_size = max(5, int(7 * font_scale))
+            font = QFont("Segoe UI", scaled_size)
             font.setItalic(True)
             painter.setFont(font)
             painter.setPen(color)

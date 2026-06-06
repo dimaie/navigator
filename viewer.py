@@ -5,12 +5,12 @@ import sqlite3
 import json
 import array
 import struct
-from PySide6.QtCore import Qt, QPointF, QRectF, QThread, Signal, QPoint, QTimer
+from PySide6.QtCore import Qt, QPointF, QRectF, QThread, Signal, QPoint, QTimer, QStringListModel
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QPolygonF
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLineEdit, QPushButton, QLabel, QStatusBar, QToolBar, QProgressBar, 
                              QMessageBox, QCompleter, QSizePolicy, QFrame, QComboBox, QColorDialog,
-                             QFileDialog, QSlider)
+                             QFileDialog, QSlider, QDialog, QListWidget)
 import constants
 import renderer
 import rules
@@ -20,7 +20,7 @@ import rules
 # Settings file path
 SETTINGS_PATH = r"./dev_settings.json"
 
-from utils import inverse_mercator, simplify_path
+from utils import inverse_mercator, simplify_path, project_mercator
 from render_worker import MapRenderWorker
 
 
@@ -134,6 +134,7 @@ class MapDataLoader(QThread):
     data_loaded = Signal(dict)          # Emitted when all data is indexed
     progress_message = Signal(str)      # Updates startup loading progress text
     progress_pct = Signal(int)          # Emitted with load percentage
+    error_occurred = Signal(str)        # Emitted when loader encounters an error
     
     def __init__(self, db_path, zoom_details=None):
         super().__init__()
@@ -169,6 +170,75 @@ class MapDataLoader(QThread):
                 conn.close()
                 return
                 
+            # One-time postcode table migration/creation if not exists
+            try:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='postcodes'")
+                if not cursor.fetchone():
+                    self.progress_message.emit("Indexing Eircodes (one-time)...")
+                    cursor.execute("""
+                    CREATE TABLE postcodes (
+                        postcode TEXT,
+                        normalized_postcode TEXT PRIMARY KEY,
+                        x REAL,
+                        y REAL
+                    )
+                    """)
+                    
+                    postcode_data = {} # normalized_postcode -> (postcode, x, y)
+                    
+                    # Check raw_nodes table
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='raw_nodes'")
+                    if cursor.fetchone():
+                        cursor.execute("SELECT lat, lon, tags FROM raw_nodes WHERE tags LIKE '%postcode%'")
+                        for lat, lon, tags_json in cursor.fetchall():
+                            try:
+                                tags = json.loads(tags_json)
+                                pc = tags.get("addr:postcode") or tags.get("postal_code")
+                                if pc:
+                                    pc = pc.strip()
+                                    norm_pc = pc.replace(" ", "").upper()
+                                    if norm_pc and norm_pc not in postcode_data:
+                                        x, y = project_mercator(lat, lon)
+                                        postcode_data[norm_pc] = (pc, x, y)
+                            except:
+                                pass
+                                
+                    # Check raw_ways table
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='raw_ways'")
+                    if cursor.fetchone():
+                        cursor.execute("SELECT nodes, tags FROM raw_ways WHERE tags LIKE '%postcode%'")
+                        for nodes_blob, tags_json in cursor.fetchall():
+                            try:
+                                tags = json.loads(tags_json)
+                                pc = tags.get("addr:postcode") or tags.get("postal_code")
+                                if pc:
+                                    pc = pc.strip()
+                                    norm_pc = pc.replace(" ", "").upper()
+                                    if norm_pc and norm_pc not in postcode_data:
+                                        num_nodes = len(nodes_blob) // 8
+                                        node_ids = struct.unpack(f"<{num_nodes}q", nodes_blob)
+                                        if node_ids:
+                                            cursor.execute("SELECT lat, lon FROM raw_nodes WHERE id = ?", (node_ids[0],))
+                                            node_row = cursor.fetchone()
+                                            if node_row:
+                                                lat, lon = node_row
+                                                x, y = project_mercator(lat, lon)
+                                                postcode_data[norm_pc] = (pc, x, y)
+                            except:
+                                pass
+                                
+                    if postcode_data:
+                        cursor.executemany(
+                            "INSERT OR IGNORE INTO postcodes (postcode, normalized_postcode, x, y) VALUES (?, ?, ?, ?)",
+                            [(pc, npc, x, y) for npc, (pc, x, y) in postcode_data.items()]
+                        )
+                        conn.commit()
+                    
+                    cursor.execute("CREATE INDEX idx_postcodes_normalized ON postcodes (normalized_postcode)")
+                    conn.commit()
+            except Exception as e:
+                print("Eircode index migration skipped/failed:", e)
+                
             self.progress_pct.emit(5)
             self.progress_message.emit("Loading configuration...")
             cursor.execute("SELECT value FROM config WHERE key='bbox'")
@@ -201,6 +271,8 @@ class MapDataLoader(QThread):
             forests_index = {sk: SpatialGridIndex(global_bbox, 24, 24) for sk in scale_keys}
             waterbodies_index = {sk: SpatialGridIndex(global_bbox, 24, 24) for sk in scale_keys}
             rivers_index = {sk: SpatialGridIndex(global_bbox, 24, 24) for sk in scale_keys}
+            railways_index = {sk: SpatialGridIndex(global_bbox, 24, 24) for sk in scale_keys}
+            boundaries_index = {sk: SpatialGridIndex(global_bbox, 24, 24) for sk in scale_keys}
             
             # Roads index mapping by highway type
             road_types = rules.ROAD_CATEGORIES
@@ -209,17 +281,38 @@ class MapDataLoader(QThread):
             # 1. Load places (cities, towns, villages) for name search/labeling
             self.progress_pct.emit(15)
             self.progress_message.emit("Loading places...")
-            cursor.execute("SELECT id, name, place_type, x, y, population FROM places ORDER BY population DESC, place_type ASC")
+            cursor.execute("""
+                SELECT p.id, p.name, p.place_type, p.x, p.y, p.population, n.tags 
+                FROM places p 
+                LEFT JOIN raw_nodes n ON p.id = n.id
+                ORDER BY p.population DESC, p.place_type ASC
+            """)
             places_rows = cursor.fetchall()
             places = []
             for r in places_rows:
+                tags = {}
+                if r[6]:
+                    try:
+                        tags = json.loads(r[6])
+                    except:
+                        pass
+                county = tags.get("place_county") or tags.get("addr:county") or tags.get("is_in:county") or tags.get("addr:state")
+                if not county and tags.get("is_in"):
+                    is_in_parts = [p.strip() for p in tags["is_in"].split(",")]
+                    for part in is_in_parts:
+                        if "county" in part.lower():
+                            county = part
+                            break
+                if county:
+                    county = county.replace("County", "").replace("Co.", "").strip()
                 places.append({
                     "id": r[0],
                     "name": r[1],
                     "place_type": r[2],
                     "x": r[3],
                     "y": r[4],
-                    "population": r[5]
+                    "population": r[5],
+                    "county": county
                 })
                 
             # 2. Load coastline ways (closed loops for land mass drawing)
@@ -301,6 +394,44 @@ class MapDataLoader(QThread):
                     if item.length >= tol:
                         rivers_index[sk].add(item, min_x, min_y, max_x, max_y)
                 
+            # 6b. Load railways
+            self.progress_pct.emit(74)
+            self.progress_message.emit("Loading railways...")
+            cursor.execute("SELECT coords, sub_type, name, min_x, min_y, max_x, max_y FROM ways WHERE feature_type='railway'")
+            railway_rows = cursor.fetchall()
+            for blob, sub_type, name, min_x, min_y, max_x, max_y in railway_rows:
+                coords = array.array('d', blob)
+                points = [QPointF(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
+                poly = QPolygonF(points)
+                simplified_polys = make_simplified_polygons(points)
+                item = MapPolygon(poly, sub_type, simplified_polys, min_x, min_y, max_x, max_y, name)
+                for sk in scale_keys:
+                    if float(sk) >= 0.003:
+                        tol = self.zoom_details.get(sk, {}).get("simplification", 0.0)
+                        if item.length >= tol:
+                            railways_index[sk].add(item, min_x, min_y, max_x, max_y)
+
+            # 6c. Load administrative boundaries
+            self.progress_pct.emit(77)
+            self.progress_message.emit("Loading boundaries...")
+            cursor.execute("SELECT coords, sub_type, name, min_x, min_y, max_x, max_y FROM ways WHERE feature_type='boundary'")
+            boundary_rows = cursor.fetchall()
+            for blob, sub_type, name, min_x, min_y, max_x, max_y in boundary_rows:
+                coords = array.array('d', blob)
+                points = [QPointF(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
+                poly = QPolygonF(points)
+                simplified_polys = make_simplified_polygons(points)
+                item = MapPolygon(poly, sub_type, simplified_polys, min_x, min_y, max_x, max_y, name)
+                for sk in scale_keys:
+                    if sub_type == '2':
+                        if float(sk) >= 0.0004:
+                            boundaries_index[sk].add(item, min_x, min_y, max_x, max_y)
+                    else:
+                        if float(sk) >= 0.003:
+                            tol = self.zoom_details.get(sk, {}).get("simplification", 0.0)
+                            if item.length >= tol:
+                                boundaries_index[sk].add(item, min_x, min_y, max_x, max_y)
+
             # 7. Load highways and map them into the custom categorized road indices
             self.progress_pct.emit(80)
             self.progress_message.emit("Loading roads...")
@@ -319,6 +450,127 @@ class MapDataLoader(QThread):
                         if item.length >= tol:
                             roads_index[sk][parent_type].add(item, min_x, min_y, max_x, max_y)
                 
+            # 8. Load all unique search names (places, roads/ways, postcodes) for incremental autocomplete
+            self.progress_message.emit("Loading search index...")
+            
+            # Build places spatial grid
+            if places:
+                min_px = min(p["x"] for p in places)
+                max_px = max(p["x"] for p in places)
+                min_py = min(p["y"] for p in places)
+                max_py = max(p["y"] for p in places)
+                
+                grid_size = 50
+                dx = (max_px - min_px) / grid_size if max_px > min_px else 1.0
+                dy = (max_py - min_py) / grid_size if max_py > min_py else 1.0
+                
+                grid = {}
+                for p in places:
+                    gx = int((p["x"] - min_px) / dx)
+                    gy = int((p["y"] - min_py) / dy)
+                    grid.setdefault((gx, gy), []).append(p)
+            else:
+                grid = {}
+                
+            def find_nearest_place(wx, wy):
+                if not places:
+                    return None
+                gx = int((wx - min_px) / dx)
+                gy = int((wy - min_py) / dy)
+                best_dist = float('inf')
+                best_place = None
+                
+                for r in range(0, 5):
+                    cells_to_check = []
+                    if r == 0:
+                        cells_to_check = [(gx, gy)]
+                    else:
+                        for i in range(-r, r + 1):
+                            cells_to_check.append((gx + i, gy - r))
+                            cells_to_check.append((gx + i, gy + r))
+                        for j in range(-r + 1, r):
+                            cells_to_check.append((gx - r, gy + j))
+                            cells_to_check.append((gx + r, gy + j))
+                            
+                    for cx, cy in cells_to_check:
+                        for p in grid.get((cx, cy), []):
+                            dist_sq = (p["x"] - wx)**2 + (p["y"] - wy)**2
+                            if dist_sq < best_dist:
+                                best_dist = dist_sq
+                                best_place = p
+                    if best_place and best_dist < (r * min(dx, dy))**2:
+                        break
+                if not best_place:
+                    for p in places:
+                        dist_sq = (p["x"] - wx)**2 + (p["y"] - wy)**2
+                        if dist_sq < best_dist:
+                            best_dist = dist_sq
+                            best_place = p
+                return best_place
+
+            search_items = []
+            seen_display_names = set()
+            
+            # Add places
+            for p in places:
+                name = p["name"]
+                county = p["county"]
+                display = f"{name}, Co. {county}" if county else name
+                if display not in seen_display_names:
+                    seen_display_names.add(display)
+                    search_items.append((name, display))
+                    search_items.append((display, display))
+                    
+            # Add postcodes
+            cursor.execute("SELECT DISTINCT postcode FROM postcodes WHERE postcode IS NOT NULL AND postcode != ''")
+            for r in cursor.fetchall():
+                pc = r[0]
+                display = f"{pc} (Postcode)"
+                if display not in seen_display_names:
+                    seen_display_names.add(display)
+                    search_items.append((pc, display))
+                    search_items.append((display, display))
+                    
+            # Add named ways
+            cursor.execute("SELECT name, min_x, min_y, max_x, max_y FROM ways WHERE name IS NOT NULL AND name != ''")
+            ways_rows = cursor.fetchall()
+            import re
+            for name, min_x, min_y, max_x, max_y in ways_rows:
+                wx = (min_x + max_x) / 2.0
+                wy = (min_y + max_y) / 2.0
+                nearest = find_nearest_place(wx, wy)
+                if nearest:
+                    t_name = nearest["name"]
+                    t_county = nearest["county"]
+                    display = f"{name}, {t_name}"
+                    if t_county:
+                        display += f", Co. {t_county}"
+                else:
+                    display = name
+                    t_name = None
+                    t_county = None
+                
+                if display not in seen_display_names:
+                    seen_display_names.add(display)
+                    # Parse combined names like "ref (name)" so both are indexed
+                    m = re.match(r"^([^(]+)\s*\(([^)]+)\)$", name)
+                    if m:
+                        ref_part = m.group(1).strip()
+                        inner_part = m.group(2).strip()
+                        if ref_part:
+                            search_items.append((ref_part, display))
+                        if inner_part:
+                            search_items.append((inner_part, display))
+                        if inner_part and nearest:
+                            desc_without_ref = f"{inner_part}, {t_name}"
+                            if t_county:
+                                desc_without_ref += f", Co. {t_county}"
+                            search_items.append((desc_without_ref, display))
+                    search_items.append((name, display))
+                    search_items.append((display, display))
+                    
+            search_items.sort(key=lambda x: x[1].lower())
+            
             conn.close()
             
             # Send loaded dictionaries back to the GUI main thread
@@ -332,13 +584,19 @@ class MapDataLoader(QThread):
                 "forests_index": forests_index,
                 "waterbodies_index": waterbodies_index,
                 "rivers_index": rivers_index,
-                "roads_index": roads_index
+                "roads_index": roads_index,
+                "railways_index": railways_index,
+                "boundaries_index": boundaries_index,
+                "search_names": search_items
             }
             self.progress_pct.emit(100)
             self.data_loaded.emit(data)
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.progress_message.emit(f"Error loading map: {str(e)}")
+            self.error_occurred.emit(str(e))
 
 
 
@@ -392,6 +650,8 @@ class MapWidget(QWidget):
         self.waterbodies_index = None
         self.rivers_index = None
         self.roads_index = None
+        self.railways_index = None
+        self.boundaries_index = None
         self.places = []
         
         # Default modern Light Mode palette settings
@@ -540,7 +800,10 @@ class MapWidget(QWidget):
             'secondary': QColor(self.colors["road_secondary"]),
             'tertiary': QColor(self.colors["road_tertiary"]),
             'unclassified': QColor(self.colors["road_unclassified"]),
-            'residential': QColor(self.colors["road_residential"])
+            'residential': QColor(self.colors["road_residential"]),
+            'living_street': QColor(self.colors["road_living_street"]),
+            'service': QColor(self.colors["road_service"]),
+            'pedestrian': QColor(self.colors["road_pedestrian"])
         }
         
         # Pen colors for high-contrast road casing borders
@@ -551,7 +814,10 @@ class MapWidget(QWidget):
             'secondary': QColor(self.colors["road_casing_secondary"]),
             'tertiary': QColor(self.colors["road_casing_tertiary"]),
             'unclassified': QColor(self.colors["road_casing_unclassified"]),
-            'residential': QColor(self.colors["road_casing_residential"])
+            'residential': QColor(self.colors["road_casing_residential"]),
+            'living_street': QColor(self.colors["road_casing_living_street"]),
+            'service': QColor(self.colors["road_casing_service"]),
+            'pedestrian': QColor(self.colors["road_casing_pedestrian"])
         }
  
     def reset_settings(self):
@@ -582,6 +848,8 @@ class MapWidget(QWidget):
         self.waterbodies_index = data["waterbodies_index"]
         self.rivers_index = data["rivers_index"]
         self.roads_index = data["roads_index"]
+        self.railways_index = data.get("railways_index")
+        self.boundaries_index = data.get("boundaries_index")
         
         # Calculate dynamic scales based on bounding box size
         if self.global_bbox:
@@ -699,6 +967,8 @@ class MapWidget(QWidget):
         """
         Triggers camera scale adjustments corresponding to slider movement.
         """
+        if not self.data_loaded:
+            return
         if getattr(self, "updating_slider", False):
             return
         min_s = self.min_scale
@@ -790,7 +1060,7 @@ class MapWidget(QWidget):
         """
         Zooms in by scaling up coordinates centered on current viewport focus.
         """
-        if self.is_rendering_detailed:
+        if not self.data_loaded:
             return
         if self.scale >= self.max_scale:
             return
@@ -804,7 +1074,7 @@ class MapWidget(QWidget):
         """
         Zooms out by scaling down coordinates centered on current viewport focus.
         """
-        if self.is_rendering_detailed:
+        if not self.data_loaded:
             return
         if self.scale <= self.min_scale:
             return
@@ -857,7 +1127,9 @@ class MapWidget(QWidget):
             "forests_index": self.forests_index,
             "waterbodies_index": self.waterbodies_index,
             "rivers_index": self.rivers_index,
-            "roads_index": self.roads_index
+            "roads_index": self.roads_index,
+            "railways_index": self.railways_index,
+            "boundaries_index": self.boundaries_index
         }
         
         self.render_worker = MapRenderWorker(
@@ -909,8 +1181,7 @@ class MapWidget(QWidget):
         """
         Initiates camera panning when left button is pressed.
         """
-        if hasattr(self, "is_rendering_detailed") and self.is_rendering_detailed:
-            event.accept()
+        if not self.data_loaded:
             return
         if event.button() == Qt.LeftButton:
             self.dragging = True
@@ -921,8 +1192,7 @@ class MapWidget(QWidget):
         """
         Terminates active panning.
         """
-        if hasattr(self, "is_rendering_detailed") and self.is_rendering_detailed:
-            event.accept()
+        if not self.data_loaded:
             return
         if event.button() == Qt.LeftButton:
             self.dragging = False
@@ -932,8 +1202,7 @@ class MapWidget(QWidget):
         """
         Pans the map view relative to movement delta and converts pointer to coordinates.
         """
-        if hasattr(self, "is_rendering_detailed") and self.is_rendering_detailed:
-            event.accept()
+        if not self.data_loaded:
             return
         px = event.position().x()
         py = event.position().y()
@@ -963,10 +1232,8 @@ class MapWidget(QWidget):
         """
         Handles zoom actions keeping the geographic center of the map constant.
         """
-        if hasattr(self, "is_rendering_detailed") and self.is_rendering_detailed:
-            event.accept()
+        if not self.data_loaded:
             return
-            
         zoom_factor = 1.25 if event.angleDelta().y() > 0 else 0.8
         new_scale = self.scale * zoom_factor
         new_scale = max(self.min_scale, min(self.max_scale, new_scale))
@@ -984,10 +1251,9 @@ class MapWidget(QWidget):
         """
         Performs vector hit-detection on the map to trigger a custom color picker.
         """
-        if hasattr(self, "is_rendering_detailed") and self.is_rendering_detailed:
-            event.accept()
+        if not self.data_loaded:
             return
-        if event.button() == Qt.LeftButton and self.data_loaded:
+        if event.button() == Qt.LeftButton:
             px = event.position().x()
             py = event.position().y()
             mx, my = self.to_mercator(px, py)
@@ -1171,6 +1437,70 @@ class PreprocessorWorker(QThread):
             self.error.emit(str(e))
 
 
+class NonFilteringCompleter(QCompleter):
+    def splitPath(self, path):
+        return []
+
+
+class AllMatchesDialog(QDialog):
+    def __init__(self, query, matches, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("All Matching Results")
+        self.resize(550, 450)
+        self.selected_match = None
+        self.matches = matches
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        
+        self.label = QLabel(f"Matching results for '{query}' ({len(matches)} found):")
+        self.label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        layout.addWidget(self.label)
+        
+        self.filter_box = QLineEdit()
+        self.filter_box.setPlaceholderText("Type to filter results dynamically...")
+        self.filter_box.setFont(QFont("Segoe UI", 10))
+        self.filter_box.textChanged.connect(self.filter_items)
+        layout.addWidget(self.filter_box)
+        
+        self.list_widget = QListWidget()
+        self.list_widget.setFont(QFont("Segoe UI", 10))
+        self.list_widget.itemDoubleClicked.connect(self.accept)
+        layout.addWidget(self.list_widget)
+        
+        self.populate_list(matches)
+        
+        btn_layout = QHBoxLayout()
+        self.btn_select = QPushButton("Select")
+        self.btn_select.clicked.connect(self.accept)
+        self.btn_select.setFont(QFont("Segoe UI", 10))
+        
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_cancel.setFont(QFont("Segoe UI", 10))
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_select)
+        btn_layout.addWidget(self.btn_cancel)
+        layout.addLayout(btn_layout)
+        
+    def populate_list(self, items):
+        self.list_widget.clear()
+        self.list_widget.addItems(items)
+        if items:
+            self.list_widget.setCurrentRow(0)
+        
+    def filter_items(self, text):
+        q = text.lower().strip()
+        filtered = [m for m in self.matches if q in m.lower()]
+        self.populate_list(filtered)
+        
+    def get_selected(self):
+        item = self.list_widget.currentItem()
+        return item.text() if item else None
+
+
 class MainWindow(QMainWindow):
     """
     Main Application Window container.
@@ -1233,10 +1563,6 @@ class MainWindow(QMainWindow):
         self.btn_zoom_out.clicked.connect(self.zoom_out)
         self.toolbar.addWidget(self.btn_zoom_out)
         
-        self.btn_fit = QPushButton("🗺 Fit Map")
-        self.btn_fit.clicked.connect(self.fit_country)
-        self.toolbar.addWidget(self.btn_fit)
-        
         self.toolbar.addSeparator()
         
         # Auto-complete search bar setup
@@ -1268,17 +1594,38 @@ class MainWindow(QMainWindow):
             if self.db_path.endswith(".osm.pbf"):
                 self.db_path_pbf = self.db_path
                 self.db_path = None
+                self.set_controls_enabled(False)
                 QTimer.singleShot(100, self.convert_pbf_on_startup)
             else:
                 self.loader = MapDataLoader(self.db_path, self.map_widget.zoom_details)
                 self.loader.progress_message.connect(self.show_loading_status)
                 self.loader.progress_pct.connect(self.update_load_progress)
                 self.loader.data_loaded.connect(self.on_data_loaded)
+                self.loader.error_occurred.connect(self.on_data_load_error)
                 
-                # Wait timer checking for db preprocessing completion
-                self.db_check_timer = QTimer(self)
-                self.db_check_timer.timeout.connect(self.check_database_and_load)
-                self.db_check_timer.start(1000)
+                # Check database immediately. If valid, start loading and lock controls.
+                db_valid = False
+                if os.path.exists(self.db_path):
+                    try:
+                        conn = sqlite3.connect(self.db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='config'")
+                        if cursor.fetchone()[0] > 0:
+                            cursor.execute("SELECT count(*) FROM ways")
+                            if cursor.fetchone()[0] > 0:
+                                db_valid = True
+                        conn.close()
+                    except:
+                        pass
+                
+                if db_valid:
+                    self.set_controls_enabled(False)
+                    self.loader.start()
+                else:
+                    # Wait timer checking for db preprocessing completion
+                    self.db_check_timer = QTimer(self)
+                    self.db_check_timer.timeout.connect(self.check_database_and_load)
+                    self.db_check_timer.start(1000)
         else:
             self.progress_bar.hide()
             self.show_loading_status(constants.STR_NO_MAP_LOADED)
@@ -1297,6 +1644,7 @@ class MainWindow(QMainWindow):
                     if cursor.fetchone()[0] > 0:
                         conn.close()
                         self.db_check_timer.stop()
+                        self.set_controls_enabled(False)
                         self.loader.start()
                         return
                 conn.close()
@@ -1311,12 +1659,26 @@ class MainWindow(QMainWindow):
     def update_load_progress(self, pct):
         self.progress_bar.setValue(pct)
   
+    def set_controls_enabled(self, enabled):
+        self.btn_open_file.setEnabled(enabled)
+        self.btn_zoom_in.setEnabled(enabled)
+        self.btn_zoom_out.setEnabled(enabled)
+        self.search_box.setEnabled(enabled)
+        self.btn_search.setEnabled(enabled)
+        self.map_widget.setEnabled(enabled)
+
+    def on_data_load_error(self, err_msg):
+        self.set_controls_enabled(True)
+        self.progress_bar.hide()
+        QMessageBox.critical(self, "Error", f"Failed to load map data: {err_msg}")
+
     def on_data_loaded(self, data):
         """
         Executes on data loaded signal. Setup auto-completer and updates map.
         
         Passes the active database filename to the MapWidget to enable per-map viewport saving.
         """
+        self.set_controls_enabled(True)
         self.progress_bar.hide()
         self.status_bar.showMessage(constants.STR_MAP_LOADED_SUCCESS, 5000)
         self.map_widget.set_map_data(data, os.path.basename(self.db_path))
@@ -1326,12 +1688,128 @@ class MainWindow(QMainWindow):
         map_name = map_name.replace('_', ' ').replace('-', ' ').title()
         self.setWindowTitle(f"{constants.STR_APP_TITLE_BASE} - {map_name}")
         
-        # Map place names to Search Completer
-        names = [p["name"] for p in data["places"]]
-        completer = QCompleter(names, self)
-        completer.setCaseSensitivity(Qt.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchContains)
-        self.search_box.setCompleter(completer)
+        # Setup dynamic search completer using prefix + Levenshtein suggestions
+        self.all_search_names = data.get("search_names", [])
+        self.completer_model = QStringListModel(self)
+        self.search_completer = NonFilteringCompleter(self.completer_model, self)
+        self.search_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.search_completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.search_completer.activated.connect(self.on_completer_activated)
+        self.search_box.setCompleter(self.search_completer)
+        
+        if getattr(self, "search_connected", False):
+            try:
+                self.search_box.textEdited.disconnect(self.on_search_text_edited)
+            except Exception:
+                pass
+            
+        self.search_box.textEdited.connect(self.on_search_text_edited)
+        self.search_connected = True
+   
+    def on_search_text_edited(self, text):
+        """
+        Dynamically updates autocomplete suggestions using prefix matching
+        and Levenshtein distance on spelling corrections.
+        """
+        if text.startswith("Show all matches..."):
+            return
+            
+        self.last_typed_search = text
+        q = text.strip().lower()
+        if not q or len(q) < 2:
+            self.completer_model.setStringList([])
+            return
+            
+        # 1. Prefix matches on search_key
+        prefix_matches = []
+        seen = set()
+        for search_key, display_name in self.all_search_names:
+            if search_key.lower().startswith(q):
+                if display_name not in seen:
+                    seen.add(display_name)
+                    prefix_matches.append(display_name)
+                    if len(prefix_matches) >= 1000:  # Cap at 1000 total results for performance
+                        break
+                        
+        suggestions = list(prefix_matches)
+        
+        # Helper for Levenshtein distance
+        def levenshtein_distance(s1, s2):
+            if len(s1) < len(s2):
+                return levenshtein_distance(s2, s1)
+            if len(s2) == 0:
+                return len(s1)
+            
+            previous_row = range(len(s2) + 1)
+            for i, c1 in enumerate(s1):
+                current_row = [i + 1]
+                for j, c2 in enumerate(s2):
+                    insertions = previous_row[j + 1] + 1
+                    deletions = current_row[j] + 1
+                    substitutions = previous_row[j] + (c1 != c2)
+                    current_row.append(min(insertions, deletions, substitutions))
+                previous_row = current_row
+                
+            return previous_row[-1]
+            
+        # 2. Levenshtein matches if query is at least 3 chars and suggestions are few
+        if len(q) >= 3 and len(suggestions) < 15:
+            first_char = q[0]
+            # Filter candidates starting with the same first character, 
+            # length difference <= 2, and not already matched by prefix
+            candidates = [
+                (sk, dn) for sk, dn in self.all_search_names
+                if len(sk) > 0 and sk[0].lower() == first_char
+                and abs(len(sk) - len(q)) <= 2
+                and not sk.lower().startswith(q)
+            ]
+            
+            lev_results = []
+            for sk, dn in candidates:
+                dist = levenshtein_distance(q, sk.lower())
+                if dist <= 2:
+                    lev_results.append((dist, dn))
+                    
+            lev_results.sort(key=lambda x: (x[0], x[1].lower()))
+            lev_matches = [r[1] for r in lev_results]
+            
+            for m in lev_matches:
+                if m not in seen:
+                    seen.add(m)
+                    suggestions.append(m)
+                    if len(suggestions) >= 1000:
+                        break
+                        
+        self.current_unfiltered_suggestions = suggestions
+        
+        # Suffix a special entry if total suggestions exceed 30
+        if len(suggestions) > 30:
+            display_list = suggestions[:30] + [f"Show all matches... ({len(suggestions)} results)"]
+        else:
+            display_list = suggestions
+            
+        self.completer_model.setStringList(display_list)
+        self.search_completer.setCompletionPrefix("")
+        self.search_completer.complete()
+
+    def on_completer_activated(self, text):
+        if text.startswith("Show all matches..."):
+            QTimer.singleShot(0, self.open_all_matches_dialog)
+
+    def open_all_matches_dialog(self):
+        query = getattr(self, "last_typed_search", "")
+        self.search_box.setText(query)
+        
+        all_matches = getattr(self, "current_unfiltered_suggestions", [])
+        if not all_matches:
+            return
+            
+        dialog = AllMatchesDialog(query, all_matches, self)
+        if dialog.exec() == QDialog.Accepted:
+            selected = dialog.get_selected()
+            if selected:
+                self.search_box.setText(selected)
+                self.search_place()
   
     def update_coordinates(self, lat, lon):
         self.coord_label.setText(f"Lat: {lat:.5f}° N, Lon: {lon:.5f}° W")
@@ -1342,12 +1820,7 @@ class MainWindow(QMainWindow):
     def zoom_out(self):
         self.map_widget.zoom_out()
   
-    def fit_country(self):
-        if self.map_widget.is_rendering_detailed:
-            return
-        if self.map_widget.data_loaded:
-            self.map_widget.fit_to_bbox(self.map_widget.global_bbox)
-            
+
     def convert_pbf_on_startup(self):
         pbf_path = self.db_path_pbf
         self.convert_pbf_to_db(pbf_path)
@@ -1389,7 +1862,6 @@ class MainWindow(QMainWindow):
         self.btn_open_file.setEnabled(False)
         self.btn_zoom_in.setEnabled(False)
         self.btn_zoom_out.setEnabled(False)
-        self.btn_fit.setEnabled(False)
         self.search_box.setEnabled(False)
         self.btn_search.setEnabled(False)
         
@@ -1412,7 +1884,6 @@ class MainWindow(QMainWindow):
         self.btn_open_file.setEnabled(True)
         self.btn_zoom_in.setEnabled(True)
         self.btn_zoom_out.setEnabled(True)
-        self.btn_fit.setEnabled(True)
         self.search_box.setEnabled(True)
         self.btn_search.setEnabled(True)
         
@@ -1423,7 +1894,6 @@ class MainWindow(QMainWindow):
         self.btn_open_file.setEnabled(True)
         self.btn_zoom_in.setEnabled(True)
         self.btn_zoom_out.setEnabled(True)
-        self.btn_fit.setEnabled(True)
         self.search_box.setEnabled(True)
         self.btn_search.setEnabled(True)
         
@@ -1450,18 +1920,18 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.show()
         
+        self.set_controls_enabled(False)
         self.loader = MapDataLoader(self.db_path, self.map_widget.zoom_details)
         self.loader.progress_message.connect(self.show_loading_status)
         self.loader.progress_pct.connect(self.update_load_progress)
         self.loader.data_loaded.connect(self.on_data_loaded)
+        self.loader.error_occurred.connect(self.on_data_load_error)
         self.loader.start()
   
     def search_place(self):
         """
-        Searches places by name and centers camera focal point around search target.
+        Searches postcodes, town names, and named roads/features, then centers the view.
         """
-        if self.map_widget.is_rendering_detailed:
-            return
         if not self.map_widget.data_loaded:
             return
             
@@ -1469,28 +1939,180 @@ class MainWindow(QMainWindow):
         if not search_text:
             return
             
-        # Match exact name first, then partial contents
-        matches = [p for p in self.map_widget.places if p["name"].lower() == search_text.lower()]
-        if not matches:
-            matches = [p for p in self.map_widget.places if search_text.lower() in p["name"].lower()]
+        # Parse potential suffix or descriptive commas
+        clean_q = search_text
+        if clean_q.endswith(" (Postcode)"):
+            clean_q = clean_q[:-11].strip()
             
-        if matches:
-            target = matches[0]
-            self.map_widget.center_x = target["x"]
-            self.map_widget.center_y = target["y"]
+        # Check if there are commas (e.g. "Road, Town, Co. County" or "Place, Co. County")
+        parts = [p.strip() for p in clean_q.split(",")]
+        base_name = parts[0]
+        
+        # 1. Check for Eircode / Postcode
+        norm_q = clean_q.replace(" ", "").upper()
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
             
-            # Dynamic zoom scale adjustments depending on feature types
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='postcodes'")
+            if cursor.fetchone():
+                # Exact match first
+                cursor.execute("SELECT postcode, x, y FROM postcodes WHERE normalized_postcode = ?", (norm_q,))
+                row = cursor.fetchone()
+                if row:
+                    pc, x, y = row
+                    conn.close()
+                    
+                    self.map_widget.center_x = x
+                    self.map_widget.center_y = y
+                    self.map_widget.scale = 0.1  # Zoom in close for postcode
+                    self.map_widget.start_interaction()
+                    self.map_widget.constrain_view()
+                    self.map_widget.update()
+                    self.status_bar.showMessage(f"Centered on Eircode: {pc}", 4000)
+                    self.map_widget.setFocus()
+                    return
+                    
+                # Check if it is a 7-character Eircode (e.g. R32CH9D)
+                # If so, fall back to its routing key (first 3 characters) area centroid
+                fallback_q = norm_q
+                is_full_eircode = len(norm_q) == 7 and norm_q[0].isalpha()
+                if is_full_eircode:
+                    fallback_q = norm_q[:3]
+                
+                # Prefix match next (using either original prefix or the 3-character routing key fallback)
+                cursor.execute("SELECT postcode, x, y FROM postcodes WHERE normalized_postcode LIKE ?", (fallback_q + '%',))
+                rows = cursor.fetchall()
+                if rows:
+                    avg_x = sum(r[1] for r in rows) / len(rows)
+                    avg_y = sum(r[2] for r in rows) / len(rows)
+                    conn.close()
+                    
+                    self.map_widget.center_x = avg_x
+                    self.map_widget.center_y = avg_y
+                    self.map_widget.scale = 0.015 if len(rows) > 1 else 0.1  # zoom out to show area if multiple matches
+                    self.map_widget.start_interaction()
+                    self.map_widget.constrain_view()
+                    self.map_widget.update()
+                    
+                    if is_full_eircode:
+                        self.status_bar.showMessage(f"Exact Eircode not found offline; centered on area {fallback_q} ({len(rows)} matches)", 4000)
+                    else:
+                        self.status_bar.showMessage(f"Centered on postcode area {search_text} ({len(rows)} matches found)", 4000)
+                    self.map_widget.setFocus()
+                    return
+            conn.close()
+        except Exception as e:
+            print("Postcode search error:", e)
+            
+        # 2. Check places table (towns, villages, cities)
+        target_place = None
+        if len(parts) == 2 and parts[1].startswith("Co. "):
+            county_name = parts[1][4:].strip().lower()
+            matches = [
+                p for p in self.map_widget.places 
+                if p["name"].lower() == base_name.lower() 
+                and (p["county"] or "").lower() == county_name
+            ]
+            if matches:
+                target_place = matches[0]
+        else:
+            # Simple matching on base_name
+            matches = [p for p in self.map_widget.places if p["name"].lower() == base_name.lower()]
+            if not matches:
+                matches = [p for p in self.map_widget.places if base_name.lower() in p["name"].lower()]
+            if matches:
+                target_place = matches[0]
+                
+        if target_place:
+            self.map_widget.center_x = target_place["x"]
+            self.map_widget.center_y = target_place["y"]
+            
             zoom_map = {'city': 0.05, 'town': 0.1, 'village': 0.25}
-            self.map_widget.scale = zoom_map.get(target["place_type"], 0.1)
+            self.map_widget.scale = zoom_map.get(target_place["place_type"], 0.1)
             
             self.map_widget.start_interaction()
             self.map_widget.constrain_view()
             self.map_widget.update()
             
-            self.status_bar.showMessage(f"Centered on {target['name']} ({target['place_type'].capitalize()})", 3000)
+            self.status_bar.showMessage(f"Centered on {target_place['name']} ({target_place['place_type'].capitalize()})", 4000)
             self.map_widget.setFocus()
-        else:
-            QMessageBox.information(self, "Search", constants.STR_SEARCH_NOT_FOUND.format(search_text))
+            return
+            
+        # 3. Check ways table (named roads, lakes, forests, etc.)
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT min_x, min_y, max_x, max_y, name, sub_type 
+                FROM ways 
+                WHERE name LIKE ? 
+                LIMIT 200
+            """, (f"%{base_name}%",))
+            ways_matches = cursor.fetchall()
+            conn.close()
+            
+            if ways_matches:
+                exact_matches = [w for w in ways_matches if w[4].lower() == base_name.lower()]
+                candidates = exact_matches if exact_matches else ways_matches
+                
+                # Proximity sorting:
+                ref_x, ref_y = None, None
+                if len(parts) >= 2:
+                    town_part = parts[1]
+                    town_matches = []
+                    if len(parts) == 3 and parts[2].startswith("Co. "):
+                        county_name = parts[2][4:].strip().lower()
+                        town_matches = [
+                            p for p in self.map_widget.places 
+                            if p["name"].lower() == town_part.lower()
+                            and (p["county"] or "").lower() == county_name
+                        ]
+                    if not town_matches:
+                        town_matches = [p for p in self.map_widget.places if p["name"].lower() == town_part.lower()]
+                    
+                    if town_matches:
+                        ref_x = town_matches[0]["x"]
+                        ref_y = town_matches[0]["y"]
+                
+                if ref_x is None or ref_y is None:
+                    ref_x = self.map_widget.center_x
+                    ref_y = self.map_widget.center_y
+                    
+                def get_dist(w):
+                    cx = (w[0] + w[2]) / 2.0
+                    cy = (w[1] + w[3]) / 2.0
+                    return (cx - ref_x)**2 + (cy - ref_y)**2
+                    
+                candidates.sort(key=get_dist)
+                target_way = candidates[0]
+                
+                min_x, min_y, max_x, max_y, name, sub_type = target_way
+                cx = (min_x + max_x) / 2.0
+                cy = (min_y + max_y) / 2.0
+                
+                self.map_widget.center_x = cx
+                self.map_widget.center_y = cy
+                
+                w_w = max_x - min_x
+                w_h = max_y - min_y
+                max_dim = max(w_w, w_h, 1.0)
+                fit_scale = min(self.map_widget.width(), self.map_widget.height()) / max_dim
+                self.map_widget.scale = max(self.map_widget.min_scale, min(self.map_widget.max_scale, fit_scale))
+                
+                self.map_widget.start_interaction()
+                self.map_widget.constrain_view()
+                self.map_widget.update()
+                
+                self.status_bar.showMessage(f"Centered on road/feature: {name} ({sub_type})", 4000)
+                self.map_widget.setFocus()
+                return
+        except Exception as e:
+            print("Feature search error:", e)
+            
+        # 4. Fallback: Not found
+        QMessageBox.information(self, "Search", f"No matches found for '{search_text}'. Try Eircode, town name, or road name.")
  
     # (Developer Config methods and Reset settings handler removed)
  

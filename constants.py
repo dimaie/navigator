@@ -38,7 +38,25 @@ DEFAULT_COLORS = {
     "road_unclassified": "#EAECEE",
     "road_casing_unclassified": "#D5D8DC",
     "road_residential": "#FFFFFF",
-    "road_casing_residential": "#F8F9FA"
+    "road_casing_residential": "#F8F9FA",
+    "road_service": "#FFFFFF",
+    "road_casing_service": "#D5D8DC",
+    "road_living_street": "#FFFFFF",
+    "road_casing_living_street": "#D5D8DC",
+    "road_pedestrian": "#FCF3CF",
+    "road_casing_pedestrian": "#F9E79F",
+    "road_track": "#A1887F",
+    "road_casing_track": "#D7CCC8",
+    "road_path": "#90A4AE",
+    "road_casing_path": "#CFD8DC",
+    "road_footway": "#E57373",
+    "road_casing_footway": "#FFCDD2",
+    "road_cycleway": "#81C784",
+    "road_casing_cycleway": "#C8E6C9",
+    "railway": "#566573",
+    "railway_dash": "#FCFAF2",
+    "boundary_country": "#8E44AD",
+    "boundary_county": "#C39BD3"
 }
 
 # Default reference scale to zoom details mapping
@@ -48,7 +66,7 @@ DEFAULT_ZOOM_DETAILS = {
     "0.001":  {"roads": 3, "places": 3000,  "simplification": 500},
     "0.003":  {"roads": 5, "places": 500,   "simplification": 150},
     "0.01":   {"roads": 6, "places": 100,   "simplification": 50},
-    "0.04":   {"roads": 7, "places": 0,     "simplification": 0}
+    "0.04":   {"roads": 14, "places": 0,     "simplification": 0}
 }
 
 # Premium stylesheet style to zoom panel overlay

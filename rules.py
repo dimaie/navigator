@@ -3,14 +3,16 @@
 # Whitelisted road categories (ordered from major to minor)
 ROAD_CATEGORIES = [
     'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 
-    'unclassified', 'residential', 'living_street', 'service', 'pedestrian'
+    'unclassified', 'residential', 'living_street', 'service', 'pedestrian',
+    'track', 'path', 'footway', 'cycleway'
 ]
 
 # All valid highways tags (including link variations)
 VALID_HIGHWAYS = {
     'motorway', 'trunk', 'primary', 'secondary', 'tertiary',
     'unclassified', 'residential', 'living_street', 'service', 'pedestrian',
-    'motorway_link', 'trunk_link', 'primary_link', 'secondary_link', 'tertiary_link'
+    'motorway_link', 'trunk_link', 'primary_link', 'secondary_link', 'tertiary_link',
+    'track', 'path', 'footway', 'cycleway'
 }
 
 def is_valid_highway(sub_type):
@@ -49,32 +51,38 @@ def get_road_width_for_scale(road_type, scale, is_interacting, lod_roads_thresho
     if scale < 0.00015:
         base_widths = {
             'motorway': 1.5, 'trunk': 1.0, 'primary': 0.0, 'secondary': 0.0, 'tertiary': 0.0, 
-            'unclassified': 0.0, 'residential': 0.0, 'living_street': 0.0, 'service': 0.0, 'pedestrian': 0.0
+            'unclassified': 0.0, 'residential': 0.0, 'living_street': 0.0, 'service': 0.0, 'pedestrian': 0.0,
+            'track': 0.0, 'path': 0.0, 'footway': 0.0, 'cycleway': 0.0
         }
     elif scale < 0.0004:
         base_widths = {
             'motorway': 2.0, 'trunk': 1.5, 'primary': 1.0, 'secondary': 0.0, 'tertiary': 0.0, 
-            'unclassified': 0.0, 'residential': 0.0, 'living_street': 0.0, 'service': 0.0, 'pedestrian': 0.0
+            'unclassified': 0.0, 'residential': 0.0, 'living_street': 0.0, 'service': 0.0, 'pedestrian': 0.0,
+            'track': 0.0, 'path': 0.0, 'footway': 0.0, 'cycleway': 0.0
         }
     elif scale < 0.0012:
         base_widths = {
             'motorway': 2.5, 'trunk': 2.0, 'primary': 1.5, 'secondary': 1.0, 'tertiary': 0.8, 
-            'unclassified': 0.0, 'residential': 0.0, 'living_street': 0.0, 'service': 0.0, 'pedestrian': 0.0
+            'unclassified': 0.0, 'residential': 0.0, 'living_street': 0.0, 'service': 0.0, 'pedestrian': 0.0,
+            'track': 0.0, 'path': 0.0, 'footway': 0.0, 'cycleway': 0.0
         }
     elif scale < 0.004:
         base_widths = {
             'motorway': 3.5, 'trunk': 3.0, 'primary': 2.5, 'secondary': 1.8, 'tertiary': 1.2, 
-            'unclassified': 1.0, 'residential': 0.0, 'living_street': 0.0, 'service': 0.0, 'pedestrian': 0.0
+            'unclassified': 1.0, 'residential': 0.0, 'living_street': 0.0, 'service': 0.0, 'pedestrian': 0.0,
+            'track': 0.0, 'path': 0.0, 'footway': 0.0, 'cycleway': 0.0
         }
     elif scale < 0.015:
         base_widths = {
             'motorway': 5.0, 'trunk': 4.5, 'primary': 3.5, 'secondary': 2.5, 'tertiary': 2.0, 
-            'unclassified': 1.5, 'residential': 1.0, 'living_street': 1.0, 'service': 0.8, 'pedestrian': 0.8
+            'unclassified': 1.5, 'residential': 1.2, 'living_street': 1.5, 'service': 1.2, 'pedestrian': 1.2,
+            'track': 0.8, 'path': 0.6, 'footway': 0.6, 'cycleway': 0.6
         }
     else:
         base_widths = {
             'motorway': 7.0, 'trunk': 6.0, 'primary': 5.0, 'secondary': 4.0, 'tertiary': 3.0, 
-            'unclassified': 2.5, 'residential': 1.5, 'living_street': 1.5, 'service': 1.2, 'pedestrian': 1.2
+            'unclassified': 2.5, 'residential': 2.0, 'living_street': 2.5, 'service': 2.0, 'pedestrian': 2.0,
+            'track': 1.2, 'path': 1.0, 'footway': 1.0, 'cycleway': 1.0
         }
         
     return base_widths.get(road_type, 1.0)
@@ -106,7 +114,7 @@ def is_valid_polygon(feature_type, node_count):
 
 # Place classification rules
 def is_city_town_village(place_type, name):
-    return place_type in ("city", "town", "village") and bool(name)
+    return place_type in ("city", "town", "village", "county") and bool(name)
 
 def get_place_font_style(place_type):
     """
@@ -116,6 +124,8 @@ def get_place_font_style(place_type):
         return 11, True
     elif place_type == "town":
         return 9, False
+    elif place_type == "county":
+        return 10, True
     return 8, False
 
 def get_place_marker_style(place_type):
@@ -124,4 +134,6 @@ def get_place_marker_style(place_type):
     """
     if place_type == "city":
         return 4.0, "#E74C3C"
+    elif place_type == "county":
+        return 0.0, ""
     return 2.5, "#2C3E50"
