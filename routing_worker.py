@@ -6,6 +6,27 @@ import array
 import math
 import heapq
 from PySide6.QtCore import QThread, Signal, QPointF
+from utils import inverse_mercator
+
+
+def get_ground_distance(pts):
+    """
+    Computes the true ground distance of a list of QPointF Mercator points
+    by correcting the scale distortion at their latitude.
+    """
+    if len(pts) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(len(pts) - 1):
+        p1, p2 = pts[i], pts[i+1]
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+        merc_dist = math.sqrt(dx*dx + dy*dy)
+        y_mid = (p1.y() + p2.y()) / 2.0
+        scale_factor = 1.0 / math.cosh(y_mid / 6378137.0)
+        total += merc_dist * scale_factor
+    return total
+
 
 def project_point_to_segment(p, a, b):
     ab_x = b.x() - a.x()
@@ -74,12 +95,17 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
     Returns (route_points, total_distance_meters, total_time_seconds)
     """
     # Direct path routing for very close points
-    dx = end_coord.x() - start_coord.x()
-    dy = end_coord.y() - start_coord.y()
-    direct_meters = math.sqrt(dx*dx + dy*dy)
+    direct_meters = get_ground_distance([start_coord, end_coord])
     if direct_meters < 100.0:
         walk_speed_mps = 5.0 / 3.6
-        return [start_coord, end_coord], direct_meters, direct_meters / walk_speed_mps
+        dest_lat, dest_lon = inverse_mercator(end_coord.x(), end_coord.y())
+        directions = [f"- Drive for {int(direct_meters)} m to destination at ({dest_lat:.5f}, {dest_lon:.5f})"]
+        total_seconds = direct_meters / walk_speed_mps
+        dur_mins = total_seconds / 60.0
+        dur_str = f"{max(1, int(dur_mins))}m" if dur_mins < 60.0 else f"{int(dur_mins // 60)}h {int(dur_mins % 60)}m"
+        len_str = f"{direct_meters/1000.0:.1f} km" if direct_meters >= 1000.0 else f"{int(direct_meters)} m"
+        directions.append(f"\nTotal route length: {len_str} (Estimated travel time: {dur_str})")
+        return [start_coord, end_coord], direct_meters, total_seconds, directions
 
     # Parse profile values
     distance_weight = profile.get("distance_weight", 1.0)
@@ -166,7 +192,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
         edge_b, proj_b, idx_b, pts_b = find_nearest_edge_local(end_coord)
         
         if not edge_a or not edge_b:
-            return None, 0.0, 0.0
+            return None, 0.0, 0.0, []
             
         sx, sy = proj_a.x(), proj_a.y()
         ex, ey = proj_b.x(), proj_b.y()
@@ -219,14 +245,21 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
             a_before_b = is_a_before_b_on_edge(pts_a, proj_a, idx_a, proj_b, idx_b)
             
             # Check if direct line path is shorter than theSnapped detour
-            def dist_p(p1, p2):
-                return math.sqrt((p1.x() - p2.x())**2 + (p1.y() - p2.y())**2)
-            d_start_proj = dist_p(start_coord, proj_a)
-            d_end_proj = dist_p(end_coord, proj_b)
-            detour_meters = d_start_proj + dist_ab + d_end_proj
+            d_start_proj = get_ground_distance([start_coord, proj_a])
+            d_end_proj = get_ground_distance([end_coord, proj_b])
+            y_mid_ab = (proj_a.y() + proj_b.y()) / 2.0
+            dist_ab_ground = dist_ab / math.cosh(y_mid_ab / 6378137.0)
+            detour_meters = d_start_proj + dist_ab_ground + d_end_proj
             if direct_meters < detour_meters:
                 walk_speed_mps = 5.0 / 3.6
-                return [start_coord, end_coord], direct_meters, direct_meters / walk_speed_mps
+                dest_lat, dest_lon = inverse_mercator(end_coord.x(), end_coord.y())
+                directions = [f"- Drive for {int(direct_meters)} m to destination at ({dest_lat:.5f}, {dest_lon:.5f})"]
+                total_seconds = direct_meters / walk_speed_mps
+                dur_mins = total_seconds / 60.0
+                dur_str = f"{max(1, int(dur_mins))}m" if dur_mins < 60.0 else f"{int(dur_mins // 60)}h {int(dur_mins % 60)}m"
+                len_str = f"{direct_meters/1000.0:.1f} km" if direct_meters >= 1000.0 else f"{int(direct_meters)} m"
+                directions.append(f"\nTotal route length: {len_str} (Estimated travel time: {dur_str})")
+                return [start_coord, end_coord], direct_meters, total_seconds, directions
             
             if oneway == 0:
                 g[-1].append((-2, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"]))
@@ -328,7 +361,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                     heapq.heappush(pq, (f_score, v))
                     
         if not found:
-            return None, 0.0, 0.0
+            return None, 0.0, 0.0, []
             
         # Reconstruct transitions sequence (from_node, to_node, edge_id)
         transitions = []
@@ -359,15 +392,15 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
         for idx in range(0, len(edge_ids), chunk_size):
             chunk = edge_ids[idx:idx+chunk_size]
             placeholders = ",".join("?" for _ in chunk)
-            cursor.execute(f"SELECT id, from_node, to_node, length, way_type, coords FROM routing_edges WHERE id IN ({placeholders})", chunk)
+            cursor.execute(f"SELECT id, from_node, to_node, length, way_type, name, is_roundabout, coords FROM routing_edges WHERE id IN ({placeholders})", chunk)
             
             for row in cursor.fetchall():
-                eid, f_node, t_node, length, wtype, blob = row
+                eid, f_node, t_node, length, wtype, rname, is_rab, blob = row
                 coords = array.array('d', blob)
                 pts = [QPointF(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
                 edge_data[eid] = {
                     "from_node": f_node, "to_node": t_node, "pts": pts, 
-                    "length": length, "way_type": wtype
+                    "length": length, "way_type": wtype, "name": rname, "is_roundabout": is_rab
                 }
                 
         route_points = []
@@ -381,11 +414,6 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
             pts = data["pts"]
             length = data["length"]
             wtype = data["way_type"]
-            
-            # Compute total distance and duration (using full edge details for total stats)
-            total_meters += length
-            speed_kmh = speeds.get(wtype) or fallback_speeds.get(wtype, 50)
-            total_seconds += length / (speed_kmh / 3.6)
             
             sub_pts = []
             if u == -1 and v == -2:
@@ -414,6 +442,12 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                 else:
                     sub_pts = list(reversed(pts))
                     
+            # Compute total distance and duration (using traversed path segment coords for accuracy)
+            ground_length = get_ground_distance(sub_pts)
+            total_meters += ground_length
+            speed_kmh = speeds.get(wtype) or fallback_speeds.get(wtype, 50)
+            total_seconds += ground_length / (speed_kmh / 3.6)
+                    
             for pt in sub_pts:
                 if not route_points or route_points[-1] != pt:
                     route_points.append(pt)
@@ -429,7 +463,182 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
         else:
             route_points = [start_coord, end_coord]
             
-        return route_points, total_meters, total_seconds
+        # Leg Grouping
+        legs = []
+        for u, v, edge_id in transitions:
+            if edge_id not in edge_data:
+                continue
+            data = edge_data[edge_id]
+            is_rab = data.get("is_roundabout", 0) == 1
+            name = data.get("name") or ""
+            norm_name = name.strip()
+            if is_rab:
+                norm_name = "roundabout"
+            elif not norm_name:
+                norm_name = "unnamed road"
+                
+            length = data["length"]
+            pts = data["pts"]
+            if u != data["from_node"]:
+                pts = list(reversed(pts))
+                
+            sub_pts = []
+            if u == -1 and v == -2:
+                a_before_b = is_a_before_b_on_edge(pts, proj_a, idx_a, proj_b, idx_b)
+                if a_before_b:
+                    sub_pts = [proj_a] + pts[idx_a + 1:idx_b + 1] + [proj_b]
+                else:
+                    sub_pts = [proj_a] + list(reversed(pts[idx_b + 1:idx_a + 1])) + [proj_b]
+            elif u == -1:
+                if v == data["to_node"]:
+                    sub_pts = [proj_a] + pts[idx_a + 1:]
+                else:
+                    sub_pts = [proj_a] + list(reversed(pts[:idx_a + 1]))
+            elif v == -2:
+                if u == data["from_node"]:
+                    sub_pts = pts[:idx_b + 1] + [proj_b]
+                else:
+                    sub_pts = list(reversed(pts[idx_b + 1:])) + [proj_b]
+            else:
+                if u == data["from_node"] and v == data["to_node"]:
+                    sub_pts = pts
+                else:
+                    sub_pts = list(reversed(pts))
+                    
+            ground_length = get_ground_distance(sub_pts)
+            if legs and legs[-1]["is_roundabout"] == is_rab and (is_rab or legs[-1]["name"] == norm_name):
+                legs[-1]["length"] += ground_length
+                for pt in sub_pts:
+                    if not legs[-1]["pts"] or legs[-1]["pts"][-1] != pt:
+                        legs[-1]["pts"].append(pt)
+                if is_rab:
+                    legs[-1]["nodes"].append(v)
+            else:
+                legs.append({
+                    "name": norm_name,
+                    "length": ground_length,
+                    "pts": list(sub_pts),
+                    "is_roundabout": is_rab,
+                    "nodes": [u, v] if is_rab else []
+                })
+                
+        # Generate directions
+        directions = []
+        if legs:
+            for i in range(len(legs)):
+                leg = legs[i]
+                name = leg["name"]
+                length = leg["length"]
+                pts = leg["pts"]
+                
+                if leg.get("is_roundabout", False):
+                    # Count exits
+                    exit_count = 1
+                    rab_nodes = leg["nodes"]
+                    proh_list = list(prohibited_links)
+                    placeholders = ",".join("?" for _ in proh_list)
+                    
+                    # Skip the entry node (rab_nodes[0]) when counting intermediate exits
+                    for node in rab_nodes[1:-1]:
+                        query = """
+                            SELECT COUNT(*) FROM routing_edges 
+                            WHERE (
+                                (from_node = ? AND oneway >= 0) OR 
+                                (to_node = ? AND oneway <= 0)
+                            ) 
+                            AND is_roundabout = 0
+                        """
+                        if proh_list:
+                            query += f" AND way_type NOT IN ({placeholders})"
+                        
+                        cursor.execute(query, [node, node] + proh_list)
+                        count = cursor.fetchone()[0]
+                        exit_count += count
+                        
+                    if exit_count == 1:
+                        suffix = "1st"
+                    elif exit_count == 2:
+                        suffix = "2nd"
+                    elif exit_count == 3:
+                        suffix = "3rd"
+                    else:
+                        suffix = f"{exit_count}th"
+                        
+                    next_name = legs[i+1]["name"] if i < len(legs) - 1 else "destination"
+                    exit_pt = pts[-1]
+                    exit_lat, exit_lon = inverse_mercator(exit_pt.x(), exit_pt.y())
+                    
+                    direction = f"- At the roundabout, take the {suffix} exit onto {next_name} at ({exit_lat:.5f}, {exit_lon:.5f})"
+                    directions.append(direction)
+                else:
+                    if i == len(legs) - 1:
+                        dest_pt = pts[-1]
+                        dest_lat, dest_lon = inverse_mercator(dest_pt.x(), dest_pt.y())
+                        direction = f"- Drive on {name} for {int(length)} m to destination at ({dest_lat:.5f}, {dest_lon:.5f})"
+                        directions.append(direction)
+                    else:
+                        next_leg = legs[i+1]
+                        next_name = next_leg["name"]
+                        J = pts[-1]
+                        
+                        if len(pts) >= 2:
+                            P_in = pts[-2]
+                        else:
+                            P_in = pts[0]
+                            
+                        next_pts = next_leg["pts"]
+                        if len(next_pts) >= 2:
+                            P_out = next_pts[1]
+                        else:
+                            P_out = next_pts[0]
+                            
+                        v_in_x = J.x() - P_in.x()
+                        v_in_y = J.y() - P_in.y()
+                        v_out_x = P_out.x() - J.x()
+                        v_out_y = P_out.y() - J.y()
+                        
+                        len_in = math.sqrt(v_in_x**2 + v_in_y**2)
+                        len_out = math.sqrt(v_out_x**2 + v_out_y**2)
+                        
+                        if len_in < 1e-9 or len_out < 1e-9:
+                            turn_type = "continue straight"
+                        else:
+                            dx1, dy1 = v_in_x / len_in, v_in_y / len_in
+                            dx2, dy2 = v_out_x / len_out, v_out_y / len_out
+                            
+                            dot = dx1 * dx2 + dy1 * dy2
+                            cross = dx1 * dy2 - dy1 * dx2
+                            angle = math.degrees(math.atan2(cross, dot))
+                            
+                            if -15 <= angle <= 15:
+                                turn_type = "continue straight"
+                            elif 15 < angle <= 45:
+                                turn_type = "bear right"
+                            elif 45 < angle <= 135:
+                                turn_type = "turn right"
+                            elif angle > 135:
+                                turn_type = "make a sharp right turn"
+                            elif -45 <= angle < -15:
+                                turn_type = "bear left"
+                            elif -135 <= angle < -45:
+                                turn_type = "turn left"
+                            else:
+                                turn_type = "make a sharp left turn"
+                                
+                        junc_lat, junc_lon = inverse_mercator(J.x(), J.y())
+                        if turn_type == "continue straight":
+                            direction = f"- Drive on {name} for {int(length)} m and continue onto {next_name} at ({junc_lat:.5f}, {junc_lon:.5f})"
+                        else:
+                            direction = f"- Drive on {name} for {int(length)} m and {turn_type} to {next_name} at ({junc_lat:.5f}, {junc_lon:.5f})"
+                        directions.append(direction)
+        else:
+            directions = ["- Proceed to destination"]
+            
+        dur_mins = total_seconds / 60.0
+        dur_str = f"{max(1, int(dur_mins))}m" if dur_mins < 60.0 else f"{int(dur_mins // 60)}h {int(dur_mins % 60)}m"
+        len_str = f"{total_meters/1000.0:.1f} km" if total_meters >= 1000.0 else f"{int(total_meters)} m"
+        directions.append(f"\nTotal route length: {len_str} (Estimated travel time: {dur_str})")
+        return route_points, total_meters, total_seconds, directions
     finally:
         conn.close()
 
@@ -439,7 +648,7 @@ class RoutingWorker(QThread):
     Background worker thread that lazily loads the routing graph on-demand
     and calculates path calculations using A* search.
     """
-    route_completed = Signal(object, float, float, object, object, str) # points, distance, duration, graph, coords, used_profile
+    route_completed = Signal(object, float, float, object, object, str, list) # points, distance, duration, graph, coords, used_profile, directions
     route_failed = Signal(str)
     graph_loaded = Signal(object, object) # Emitted immediately when graph completes lazy-loading
     
@@ -503,9 +712,9 @@ class RoutingWorker(QThread):
                     self.routing_graph, self.routing_nodes_coords,
                     self.db_path, profile_dict
                 )
-                pts, dist, duration = res
+                pts, dist, duration, directions = res
                 if pts:
-                    self.route_completed.emit(pts, dist, duration, self.routing_graph, self.routing_nodes_coords, curr_profile_name)
+                    self.route_completed.emit(pts, dist, duration, self.routing_graph, self.routing_nodes_coords, curr_profile_name, directions)
                     return
                     
                 # Try fallback profile

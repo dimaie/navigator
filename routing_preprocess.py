@@ -123,7 +123,7 @@ def compile_routing(db_path, progress_callback=None):
     
     edges_to_insert = []
     
-    def save_edge(from_node, to_node, segment_nodes, name, way_type, oneway):
+    def save_edge(from_node, to_node, segment_nodes, name, way_type, oneway, is_roundabout):
         coords = []
         for nid in segment_nodes:
             if nid in node_coords:
@@ -144,11 +144,12 @@ def compile_routing(db_path, progress_callback=None):
         coord_flat = [val for pt in coords for val in pt]
         blob = struct.pack(f"<{len(coord_flat)}d", *coord_flat)
         
-        edges_to_insert.append((from_node, to_node, length, way_type, name, oneway, blob))
+        edges_to_insert.append((from_node, to_node, length, way_type, name, oneway, is_roundabout, blob))
         
     for way_id, (node_ids, tags) in ways_data.items():
         name = tags.get("name", "")
         way_type = tags.get("highway", "")
+        is_roundabout = 1 if tags.get("junction") == "roundabout" else 0
         
         # Parse one-way attribute
         oneway_tag = tags.get("oneway", "no")
@@ -157,6 +158,9 @@ def compile_routing(db_path, progress_callback=None):
             oneway = 1
         elif oneway_tag == "-1":
             oneway = -1
+        elif tags.get("junction") == "roundabout":
+            # Roundabouts are implicitly oneway in the digitized direction
+            oneway = 1
             
         current_segment = []
         start_junction = node_ids[0]
@@ -165,11 +169,11 @@ def compile_routing(db_path, progress_callback=None):
             current_segment.append(nid)
             # If this node is a junction (excluding the starting junction itself)
             if nid in junctions and nid != start_junction:
-                save_edge(start_junction, nid, current_segment, name, way_type, oneway)
+                save_edge(start_junction, nid, current_segment, name, way_type, oneway, is_roundabout)
                 start_junction = nid
                 current_segment = [nid]
             elif i == len(node_ids) - 1 and nid != start_junction:
-                save_edge(start_junction, nid, current_segment, name, way_type, oneway)
+                save_edge(start_junction, nid, current_segment, name, way_type, oneway, is_roundabout)
                 
     print(f"Generated {len(edges_to_insert)} directed routing edges in {time.time() - t0:.1f}s.")
     
@@ -199,6 +203,7 @@ def compile_routing(db_path, progress_callback=None):
         way_type TEXT,
         name TEXT,
         oneway INTEGER,
+        is_roundabout INTEGER,
         coords BLOB
     )
     """)
@@ -216,7 +221,7 @@ def compile_routing(db_path, progress_callback=None):
     
     # Save routing edges
     cursor.executemany(
-        "INSERT INTO routing_edges (from_node, to_node, length, way_type, name, oneway, coords) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO routing_edges (from_node, to_node, length, way_type, name, oneway, is_roundabout, coords) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         edges_to_insert
     )
     print(f"Inserted {len(edges_to_insert)} routing edges.")

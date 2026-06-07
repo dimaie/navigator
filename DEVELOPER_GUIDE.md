@@ -103,6 +103,7 @@ Stores road segments between junctions.
 *   `way_type` (TEXT): Highway sub-class.
 *   `name` (TEXT): Name of the street.
 *   `oneway` (INTEGER): One-way status: `0` (two-way), `1` (one-way from $\to$ to), `-1` (one-way to $\to$ from).
+*   `is_roundabout` (INTEGER): Roundabout status: `1` if part of a roundabout, `0` otherwise.
 *   `coords` (BLOB): Binary double BLOB of path coordinates.
 
 ---
@@ -110,6 +111,7 @@ Stores road segments between junctions.
 ## 4. Routing Profile System
 
 Routing calculations are governed by profiles defined inside [config.json](file:///c:/Work/Maps/config.json). Each profile specifies:
+*   `driving_side` (string): Target driving side of the road (e.g. `"left"` for Ireland).
 *   `use_speed` (bool): If true, edge cost is calculated as time (seconds). If false, edge cost is calculated as distance (meters).
 *   `speeds` (dict): Defines average speed (km/h) per road category.
 *   `multipliers` (dict): Defines priority cost multipliers per road category.
@@ -196,6 +198,7 @@ The application transitioned from an in-memory spatial index to a database-drive
 3.  **Virtual Nodes (-1 / -2)**: Project the coordinates onto the nearest edges and inject virtual nodes `-1` (start) and `-2` (end) into a cloned in-memory representation of the routing graph, splitting the edges into virtual sub-segments with ratios of their original lengths.
 4.  **Min-Heap A***: Solves the path between virtual nodes `-1` and `-2` using Euclidean distance to target as a heuristic.
 5.  **Geometry Trimming**: Reconstructs the complete route edge sequence, concatenates their geometries, and trims the path ends to begin exactly at pin A and end exactly at pin B.
+6.  **Turn-by-Turn Directions Generation**: Groups consecutive traversed edges with identical street names into legs, calculates turn directions (`turn left`, `bear right`, etc.) at leg-transition junctions using the 2D vector cross/dot product of entering/exiting segments, resolves GPS coordinates via `inverse_mercator`, and returns a text transcript available in the GUI context menu.
 
 ---
 

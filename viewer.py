@@ -10,7 +10,8 @@ from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, Q
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLineEdit, QPushButton, QLabel, QStatusBar, QToolBar, QProgressBar, 
                              QMessageBox, QCompleter, QSizePolicy, QFrame, QComboBox, QColorDialog,
-                             QFileDialog, QSlider, QDialog, QListWidget, QMenu, QDialogButtonBox)
+                             QFileDialog, QSlider, QDialog, QListWidget, QMenu, QDialogButtonBox,
+                             QPlainTextEdit)
 import constants
 import renderer
 import rules
@@ -529,6 +530,7 @@ class MapWidget(QWidget):
         self.route_mode = False
         self.route_distance = 0.0
         self.route_duration = 0.0
+        self.current_route_directions = []
         self.active_profile = {"use_speed": False, "multipliers": {}}
         self.db_path = None
         
@@ -610,9 +612,9 @@ class MapWidget(QWidget):
         self.default_zoom_details = constants.DEFAULT_ZOOM_DETAILS
         self.zoom_details = dict(self.default_zoom_details)
         self.routing_profiles = {
-            "Car": {"fallback_profile": "Bicycle", "distance_weight": 0.1, "speed_weight": 0.9, "prohibited_links": ["path", "footway", "cycleway", "pedestrian"], "speeds": {}, "multipliers": {}},
-            "Bicycle": {"fallback_profile": "Walk", "distance_weight": 0.5, "speed_weight": 0.5, "prohibited_links": ["motorway", "motorway_link"], "speeds": {}, "multipliers": {}},
-            "Walk": {"fallback_profile": None, "distance_weight": 0.9, "speed_weight": 0.1, "prohibited_links": ["motorway", "motorway_link", "trunk", "trunk_link"], "speeds": {}, "multipliers": {}}
+            "Car": {"driving_side": "left", "fallback_profile": "Bicycle", "distance_weight": 0.1, "speed_weight": 0.9, "prohibited_links": ["path", "footway", "cycleway", "pedestrian"], "speeds": {}, "multipliers": {}},
+            "Bicycle": {"driving_side": "left", "fallback_profile": "Walk", "distance_weight": 0.5, "speed_weight": 0.5, "prohibited_links": ["motorway", "motorway_link"], "speeds": {}, "multipliers": {}},
+            "Walk": {"driving_side": "left", "fallback_profile": None, "distance_weight": 0.9, "speed_weight": 0.1, "prohibited_links": ["motorway", "motorway_link", "trunk", "trunk_link"], "speeds": {}, "multipliers": {}}
         }
         
         if os.path.exists(constants.SETTINGS_PATH):
@@ -1201,10 +1203,25 @@ class MapWidget(QWidget):
         
         act_search = menu.addAction("🔍 Search Place...")
         
+        act_directions = None
+        if self.current_route is not None:
+            act_directions = menu.addAction("📄 Show Route Directions")
+            
         action = menu.exec(event.globalPos())
         
         if action == act_search:
             self.search_requested.emit(click_pt)
+        elif act_directions and action == act_directions:
+            self.show_route_directions()
+
+    def show_route_directions(self):
+        if not self.current_route_directions:
+            QMessageBox.information(self, "Directions", "No route directions available.")
+            return
+            
+        driving_side = self.active_profile.get("driving_side", "left")
+        dialog = RouteDirectionsDialog(self.current_route_directions, driving_side, self)
+        dialog.exec()
 
     def handle_map_click(self, px, py):
         """
@@ -1274,12 +1291,13 @@ class MapWidget(QWidget):
         self.routing_graph = graph
         self.routing_nodes_coords = coords
         
-    def on_route_completed(self, pts, dist, duration, graph, coords, used_profile):
+    def on_route_completed(self, pts, dist, duration, graph, coords, used_profile, directions):
         self.current_route = pts
         self.route_distance = dist
         self.route_duration = duration
         self.routing_graph = graph
         self.routing_nodes_coords = coords
+        self.current_route_directions = directions
         
         dist_km = dist / 1000.0
         dur_mins = duration / 60.0
@@ -1303,6 +1321,7 @@ class MapWidget(QWidget):
 
     def on_route_failed(self, err_msg):
         self.route_end = None
+        self.current_route_directions = []
         self.status_message.emit(err_msg)
         QMessageBox.warning(self, "Routing Failed", err_msg)
         self.update()
@@ -1532,6 +1551,50 @@ class PreprocessorWorker(QThread):
 class NonFilteringCompleter(QCompleter):
     def splitPath(self, path):
         return []
+
+
+class RouteDirectionsDialog(QDialog):
+    def __init__(self, directions, driving_side="left", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Route Directions")
+        self.resize(600, 450)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        
+        self.label = QLabel(f"Turn-by-Turn Directions (Driving Side: {driving_side.upper()}):")
+        self.label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        layout.addWidget(self.label)
+        
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(QFont("Consolas" if sys.platform == "win32" else "Monospace", 10))
+        self.text_edit.setStyleSheet("background-color: #FAFAFA; border: 1px solid #DDD; padding: 5px;")
+        
+        self.text_edit.setPlainText("\n\n".join(directions))
+        layout.addWidget(self.text_edit)
+        
+        btn_layout = QHBoxLayout()
+        self.btn_copy = QPushButton("Copy to Clipboard")
+        self.btn_copy.setFont(QFont("Segoe UI", 9))
+        self.btn_copy.setStyleSheet("padding: 6px 12px;")
+        self.btn_copy.clicked.connect(self.copy_to_clipboard)
+        
+        self.btn_close = QPushButton("Close")
+        self.btn_close.setFont(QFont("Segoe UI", 9))
+        self.btn_close.setStyleSheet("padding: 6px 12px;")
+        self.btn_close.clicked.connect(self.accept)
+        
+        btn_layout.addWidget(self.btn_copy)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_close)
+        layout.addLayout(btn_layout)
+        
+    def copy_to_clipboard(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.text_edit.toPlainText())
+        QMessageBox.information(self, "Copied", "Directions copied to clipboard!")
 
 
 class AllMatchesDialog(QDialog):
@@ -2242,6 +2305,7 @@ class MainWindow(QMainWindow):
         self.map_widget.current_route = None
         self.map_widget.route_distance = 0.0
         self.map_widget.route_duration = 0.0
+        self.map_widget.current_route_directions = []
         self.desc_a = ""
         self.desc_b = ""
         self.update_search_inputs()
