@@ -445,6 +445,63 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
                     county_idx -= 1
         except Exception as e:
             pass
+            
+    # 1c. Extract and Save Transit Stations as Places generically
+    print("Extracting and saving transit stations...")
+    try:
+        # Extract station nodes
+        cursor.execute("""
+            SELECT id, tags, lat, lon FROM raw_nodes 
+            WHERE tags LIKE '%"railway": "station"%' 
+               OR tags LIKE '%"public_transport": "station"%' 
+               OR tags LIKE '%"amenity": "bus_station"%' 
+               OR tags LIKE '%"aeroway": "aerodrome"%'
+        """)
+        station_nodes = cursor.fetchall()
+        for nid, tags_json, lat, lon in station_nodes:
+            try:
+                tags = json.loads(tags_json)
+                name = tags.get("name")
+                if name:
+                    x, y = project_mercator(lat, lon)
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO places (id, name, place_type, x, y, population) VALUES (?, ?, ?, ?, ?, ?)",
+                        (nid, name, "station", x, y, 0)
+                    )
+            except Exception:
+                pass
+
+        # Extract station ways
+        cursor.execute("""
+            SELECT id, tags, nodes FROM raw_ways 
+            WHERE tags LIKE '%"railway": "station"%' 
+               OR tags LIKE '%"public_transport": "station"%' 
+               OR tags LIKE '%"amenity": "bus_station"%' 
+               OR tags LIKE '%"aeroway": "aerodrome"%'
+        """)
+        station_ways = cursor.fetchall()
+        for wid, tags_json, nodes_blob in station_ways:
+            try:
+                tags = json.loads(tags_json)
+                name = tags.get("name")
+                if name and nodes_blob:
+                    count = len(nodes_blob) // 8
+                    node_ids = struct.unpack(f"<{count}q", nodes_blob)
+                    placeholders = ",".join("?" for _ in node_ids)
+                    cursor.execute(f"SELECT lat, lon FROM raw_nodes WHERE id IN ({placeholders})", node_ids)
+                    coords = cursor.fetchall()
+                    if coords:
+                        avg_lat = sum(c[0] for c in coords) / len(coords)
+                        avg_lon = sum(c[1] for c in coords) / len(coords)
+                        x, y = project_mercator(avg_lat, avg_lon)
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO places (id, name, place_type, x, y, population) VALUES (?, ?, ?, ?, ?, ?)",
+                            (-wid, name, "station", x, y, 0)
+                        )
+            except Exception:
+                pass
+    except Exception as e:
+        print("Error extracting stations in preprocess:", e)
         
     # 2. Stitch and Save Coastlines
     if progress_callback:
@@ -592,15 +649,44 @@ def run_preprocess(pbf_path, db_path, progress_callback=None):
     conn.commit()
     conn.close()
     
+    print(f"Database saved successfully. DB Size on disk: {time.time() - db_start:.1f}s.")
+    
+    print("\n=== COMPILING ROUTING GRAPH ===")
+    if progress_callback:
+        progress_callback(99, "Compiling routing graph...")
+    import routing_preprocess
+    routing_preprocess.compile_routing(db_path, progress_callback)
+    
     if progress_callback:
         progress_callback(100, "Done!")
-    print(f"Database saved successfully. DB Size on disk: {time.time() - db_start:.1f}s.")
     print(f"Total preprocessing finished in {time.time() - start_time:.1f}s.")
 
 if __name__ == "__main__":
     import sys
     import os
     
+    if "--routing-only" in sys.argv:
+        # Resolve target DB
+        db = None
+        for arg in sys.argv[1:]:
+            if arg != "--routing-only" and arg.endswith(".db"):
+                db = arg
+                break
+        if not db:
+            db_files = [f for f in os.listdir(".") if f.endswith(".db")]
+            if len(db_files) == 1:
+                db = db_files[0]
+                print(f"Auto-detected DB file: {db}")
+            elif len(db_files) > 1:
+                print("Multiple .db files found. Please specify database file: python preprocess.py --routing-only <file.db>")
+                sys.exit(1)
+            else:
+                print("No .db files found. Usage: python preprocess.py --routing-only <file.db>")
+                sys.exit(1)
+        import routing_preprocess
+        routing_preprocess.compile_routing(db)
+        sys.exit(0)
+
     pbf = None
     db = None
     

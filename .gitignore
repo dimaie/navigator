@@ -18,6 +18,6 @@ pip-delete-this-directory.txt
 *.osm.pbf
 
 # Settings and local configs
-dev_settings.json
+config.json
 .idea/
 .vscode/

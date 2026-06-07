@@ -1,7 +1,7 @@
 # constants.py
 
 # Path to the developer/viewer settings file
-SETTINGS_PATH = r"./dev_settings.json"
+SETTINGS_PATH = r"./config.json"
 
 # Bounding box of the Web Mercator projection limits as a universal fallback
 WORLD_BBOX = {

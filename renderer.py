@@ -94,92 +94,22 @@ def render_map(width, height, center_x, center_y, scale, map_data, zoom_details,
     places_threshold = current_details.get("places", 50000)
     font_scale = get_font_scale_multiplier(scale)
     
-    # 5. Retrieve visible features from Spatial Index
-    visible_coastlines = map_data["coastlines_index"][sim_key].query(viewport_rect)
-    visible_forests = map_data["forests_index"][sim_key].query(viewport_rect)
-    visible_wetlands = map_data["wetlands_index"][sim_key].query(viewport_rect)
-    visible_waterbodies = map_data["waterbodies_index"][sim_key].query(viewport_rect)
-    visible_rivers = map_data["rivers_index"][sim_key].query(viewport_rect)
-    visible_railways = map_data["railways_index"][sim_key].query(viewport_rect) if "railways_index" in map_data else []
-    visible_boundaries = map_data["boundaries_index"][sim_key].query(viewport_rect) if "boundaries_index" in map_data else []
+    # 5. Retrieve pre-queried visible features
+    visible_coastlines = map_data.get("coastlines", [])
+    visible_forests = map_data.get("forests", [])
+    visible_wetlands = map_data.get("wetlands", [])
+    visible_waterbodies = map_data.get("waterbodies", [])
+    visible_rivers = map_data.get("rivers", [])
+    visible_railways = map_data.get("railways", [])
+    visible_boundaries = map_data.get("boundaries", [])
     
     visible_roads = {}
     for rtype in rules.ROAD_CATEGORIES:
-        # Check if this road type is visible at this LOD rank
         road_idx = rules.ROAD_CATEGORIES.index(rtype)
         if road_idx < lod_roads_threshold:
-            visible_roads[rtype] = map_data["roads_index"][sim_key][rtype].query(viewport_rect)
+            visible_roads[rtype] = map_data.get("roads", {}).get(rtype, [])
             
-    # 6. Coordinate Budgeting Fallback
-    def get_point_count(item, key):
-        if item.simplified_polygons and key in item.simplified_polygons:
-            return item.simplified_polygons[key].size()
-        return item.polygon.size()
-        
-    total_points = 0
-    total_points += sum(get_point_count(item, sim_key) for item in visible_coastlines)
-    total_points += sum(get_point_count(item, sim_key) for item in visible_forests)
-    total_points += sum(get_point_count(item, sim_key) for item in visible_wetlands)
-    total_points += sum(get_point_count(item, sim_key) for item in visible_waterbodies)
-    total_points += sum(get_point_count(item, sim_key) for item in visible_rivers)
-    if "railways_index" in map_data:
-        total_points += sum(get_point_count(item, sim_key) for item in visible_railways)
-    if "boundaries_index" in map_data:
-        total_points += sum(get_point_count(item, sim_key) for item in visible_boundaries)
-    for rtype, rlist in visible_roads.items():
-        total_points += sum(get_point_count(item, sim_key) for item in rlist)
-        
     active_sim_key = sim_key
-    scale_keys_sorted = sorted(zoom_details.keys(), key=float)
-    current_idx = scale_keys_sorted.index(sim_key)
-    
-    while total_points > frame_budget and current_idx > 0:
-        current_idx -= 1
-        test_key = scale_keys_sorted[current_idx]
-        
-        test_coastlines = map_data["coastlines_index"][test_key].query(viewport_rect)
-        test_forests = map_data["forests_index"][test_key].query(viewport_rect)
-        test_wetlands = map_data["wetlands_index"][test_key].query(viewport_rect)
-        test_waterbodies = map_data["waterbodies_index"][test_key].query(viewport_rect)
-        test_rivers = map_data["rivers_index"][test_key].query(viewport_rect)
-        test_railways = map_data["railways_index"][test_key].query(viewport_rect) if "railways_index" in map_data else []
-        test_boundaries = map_data["boundaries_index"][test_key].query(viewport_rect) if "boundaries_index" in map_data else []
-        
-        test_roads = {}
-        test_lod = zoom_details.get(test_key, {}).get("roads", 1)
-        for rtype in rules.ROAD_CATEGORIES:
-            road_idx = rules.ROAD_CATEGORIES.index(rtype)
-            if road_idx < test_lod:
-                test_roads[rtype] = map_data["roads_index"][test_key][rtype].query(viewport_rect)
-                
-        test_total = 0
-        test_total += sum(get_point_count(item, test_key) for item in test_coastlines)
-        test_total += sum(get_point_count(item, test_key) for item in test_forests)
-        test_total += sum(get_point_count(item, test_key) for item in test_wetlands)
-        test_total += sum(get_point_count(item, test_key) for item in test_waterbodies)
-        test_total += sum(get_point_count(item, test_key) for item in test_rivers)
-        if "railways_index" in map_data:
-            test_total += sum(get_point_count(item, test_key) for item in test_railways)
-        if "boundaries_index" in map_data:
-            test_total += sum(get_point_count(item, test_key) for item in test_boundaries)
-            
-        for rtype, rlist in test_roads.items():
-            test_total += sum(get_point_count(item, test_key) for item in rlist)
-            
-        total_points = test_total
-        active_sim_key = test_key
-        visible_coastlines = test_coastlines
-        visible_forests = test_forests
-        visible_wetlands = test_wetlands
-        visible_waterbodies = test_waterbodies
-        visible_rivers = test_rivers
-        visible_railways = test_railways
-        visible_boundaries = test_boundaries
-        visible_roads = test_roads
-        
-    if is_interruption_requested and is_interruption_requested():
-        painter.end()
-        return None
         
     # 7. Apply coordinate transformation matrix
     painter.save()
