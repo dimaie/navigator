@@ -28,6 +28,53 @@ def get_ground_distance(pts):
     return total
 
 
+def get_look_ahead_point(pts, is_exiting, target_dist=25.0):
+    """
+    Finds a point along the list of QPointF Mercator points at a specified ground distance
+    away from the start (for exiting leg) or end (for entering leg) of the points list.
+    Used for look-ahead angle calculations to smooth out short intersection details.
+    """
+    if not pts:
+        return None
+    if len(pts) < 2:
+        return pts[0]
+        
+    if is_exiting:
+        accum = 0.0
+        for i in range(len(pts) - 1):
+            p1, p2 = pts[i], pts[i+1]
+            dx = p2.x() - p1.x()
+            dy = p2.y() - p1.y()
+            segment_len = math.sqrt(dx*dx + dy*dy)
+            y_mid = (p1.y() + p2.y()) / 2.0
+            scale_factor = 1.0 / math.cosh(y_mid / 6378137.0)
+            ground_len = segment_len * scale_factor
+            
+            if accum + ground_len >= target_dist:
+                t = (target_dist - accum) / ground_len
+                t = max(0.0, min(1.0, t))
+                return QPointF(p1.x() + t*dx, p1.y() + t*dy)
+            accum += ground_len
+        return pts[-1]
+    else:
+        accum = 0.0
+        for i in range(len(pts) - 2, -1, -1):
+            p1, p2 = pts[i], pts[i+1]
+            dx = p2.x() - p1.x()
+            dy = p2.y() - p1.y()
+            segment_len = math.sqrt(dx*dx + dy*dy)
+            y_mid = (p1.y() + p2.y()) / 2.0
+            scale_factor = 1.0 / math.cosh(y_mid / 6378137.0)
+            ground_len = segment_len * scale_factor
+            
+            if accum + ground_len >= target_dist:
+                t = (target_dist - accum) / ground_len
+                t = max(0.0, min(1.0, t))
+                return QPointF(p2.x() - t*dx, p2.y() - t*dy)
+            accum += ground_len
+        return pts[0]
+
+
 def project_point_to_segment(p, a, b):
     ab_x = b.x() - a.x()
     ab_y = b.y() - a.y()
@@ -479,9 +526,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                 
             length = data["length"]
             pts = data["pts"]
-            if u != data["from_node"]:
-                pts = list(reversed(pts))
-                
+            
             sub_pts = []
             if u == -1 and v == -2:
                 a_before_b = is_a_before_b_on_edge(pts, proj_a, idx_a, proj_b, idx_b)
@@ -581,16 +626,10 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                         next_name = next_leg["name"]
                         J = pts[-1]
                         
-                        if len(pts) >= 2:
-                            P_in = pts[-2]
-                        else:
-                            P_in = pts[0]
+                        P_in = get_look_ahead_point(pts, is_exiting=False, target_dist=25.0)
                             
                         next_pts = next_leg["pts"]
-                        if len(next_pts) >= 2:
-                            P_out = next_pts[1]
-                        else:
-                            P_out = next_pts[0]
+                        P_out = get_look_ahead_point(next_pts, is_exiting=True, target_dist=25.0)
                             
                         v_in_x = J.x() - P_in.x()
                         v_in_y = J.y() - P_in.y()
@@ -610,20 +649,20 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                             cross = dx1 * dy2 - dy1 * dx2
                             angle = math.degrees(math.atan2(cross, dot))
                             
-                            if -15 <= angle <= 15:
+                            if -10 <= angle <= 10:
                                 turn_type = "continue straight"
-                            elif 15 < angle <= 45:
-                                turn_type = "bear right"
-                            elif 45 < angle <= 135:
-                                turn_type = "turn right"
-                            elif angle > 135:
-                                turn_type = "make a sharp right turn"
-                            elif -45 <= angle < -15:
+                            elif 10 < angle <= 45:
                                 turn_type = "bear left"
-                            elif -135 <= angle < -45:
+                            elif 45 < angle <= 135:
                                 turn_type = "turn left"
-                            else:
+                            elif angle > 135:
                                 turn_type = "make a sharp left turn"
+                            elif -45 <= angle < -10:
+                                turn_type = "bear right"
+                            elif -135 <= angle < -45:
+                                turn_type = "turn right"
+                            else:
+                                turn_type = "make a sharp right turn"
                                 
                         junc_lat, junc_lon = inverse_mercator(J.x(), J.y())
                         if turn_type == "continue straight":

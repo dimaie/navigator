@@ -24,6 +24,8 @@ SETTINGS_PATH = r"./config.json"
 from utils import inverse_mercator, simplify_path, project_mercator
 from render_worker import MapRenderWorker
 from routing_worker import RoutingWorker
+from gps import GPSRegistry
+from gps.speech import TTSManager
 
 
 class MapPolygon:
@@ -480,6 +482,8 @@ class MapWidget(QWidget):
     color_updated_signal = Signal(str, str)  # Emitted when a layer gets recolored
     route_start_changed = Signal(QPointF, str)
     route_end_changed = Signal(QPointF, str)
+    route_completed_signal = Signal()
+    route_failed_signal = Signal(str)
     search_requested = Signal(QPointF)
     status_message = Signal(str)
 
@@ -533,6 +537,12 @@ class MapWidget(QWidget):
         self.current_route_directions = []
         self.active_profile = {"use_speed": False, "multipliers": {}}
         self.db_path = None
+        
+        # GPS & Navigation state
+        self.gps_position = None  # QPointF in Web Mercator meters
+        self.gps_heading = 0.0    # heading in degrees clockwise from North
+        self.navigation_state = "inactive"  # "inactive", "navigating", "paused"
+        self.auto_center_gps = True
         
         # Default modern Light Mode palette settings
         self.default_colors = constants.DEFAULT_COLORS
@@ -1002,13 +1012,21 @@ class MapWidget(QWidget):
     def trigger_background_render(self):
         """
         Launches the background MapRenderWorker thread to render the map asynchronously.
+        If a worker is already running, stores the parameters in a pending queue to be rendered next.
         """
         if not self.data_loaded:
             return
             
-        self.abort_rendering()
-        
-        # Collect data structures to pass to background thread
+        if hasattr(self, "render_worker") and self.render_worker and self.render_worker.isRunning():
+            self.pending_render_params = {
+                "width": self.width(),
+                "height": self.height(),
+                "center_x": self.center_x,
+                "center_y": self.center_y,
+                "scale": self.scale
+            }
+            return
+            
         map_data = {
             "places": self.places
         }
@@ -1024,22 +1042,58 @@ class MapWidget(QWidget):
         self.render_worker.start()
         self.update()
 
+    def trigger_background_render_with_params(self, params):
+        """
+        Launches the background MapRenderWorker thread with specified parameters.
+        """
+        if not self.data_loaded:
+            return
+            
+        map_data = {
+            "places": self.places
+        }
+        
+        self.render_worker = MapRenderWorker(
+            params["width"], params["height"],
+            params["center_x"], params["center_y"], params["scale"],
+            self.db_path, map_data, self.zoom_details, self.colors,
+            self.frame_budget
+        )
+        self.render_worker.render_completed.connect(self.on_render_completed)
+        self.rendering_in_progress = True
+        self.render_worker.start()
+        self.update()
+
     def on_render_completed(self, img):
         """
         Slot triggered when the background QImage rendering is complete.
-        Saves the new image and triggers a screen refresh.
+        Saves the new image aligned with the worker's coordinates and triggers a screen refresh.
         """
+        worker = self.sender()
+        if worker:
+            self.image_center_x = worker.center_x
+            self.image_center_y = worker.center_y
+            self.image_scale = worker.scale
+            self.image_w = worker.width
+            self.image_h = worker.height
+        else:
+            self.image_center_x = self.center_x
+            self.image_center_y = self.center_y
+            self.image_scale = self.scale
+            self.image_w = self.width()
+            self.image_h = self.height()
+            
         self.map_image = img
-        self.image_center_x = self.center_x
-        self.image_center_y = self.center_y
-        self.image_scale = self.scale
-        self.image_w = self.width()
-        self.image_h = self.height()
-        
         self.is_interacting = False
         self.rendering_in_progress = False
         self.save_settings()
         self.update()
+        
+        # Start pending render if any new request was queued
+        if hasattr(self, "pending_render_params") and self.pending_render_params:
+            params = self.pending_render_params
+            self.pending_render_params = None
+            self.trigger_background_render_with_params(params)
 
     def start_interaction(self):
         """
@@ -1318,6 +1372,7 @@ class MapWidget(QWidget):
         
         self.start_interaction()
         self.update()
+        self.route_completed_signal.emit()
 
     def on_route_failed(self, err_msg):
         self.route_end = None
@@ -1325,6 +1380,7 @@ class MapWidget(QWidget):
         self.status_message.emit(err_msg)
         QMessageBox.warning(self, "Routing Failed", err_msg)
         self.update()
+        self.route_failed_signal.emit(err_msg)
 
     def mouseDoubleClickEvent(self, event):
         """
@@ -1508,6 +1564,36 @@ class MapWidget(QWidget):
             painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
             painter.setPen(QColor("#FFFFFF"))
             painter.drawText(QRectF(px - 10, py - 10, 20, 20), Qt.AlignCenter, "B")
+            painter.restore()
+            
+        # Draw GPS position marker
+        if self.gps_position:
+            px, py = self.to_screen(self.gps_position.x(), self.gps_position.y())
+            painter.save()
+            
+            # 1. Outer accuracy glow ring
+            painter.setPen(QPen(QColor(59, 130, 246, 50), 1.5))
+            painter.setBrush(QColor(59, 130, 246, 30))
+            painter.drawEllipse(QPointF(px, py), 18.0, 18.0)
+            
+            # 2. Main blue dot with white border
+            painter.setPen(QPen(QColor("#FFFFFF"), 2.0))
+            painter.setBrush(QColor("#3B82F6"))
+            painter.drawEllipse(QPointF(px, py), 8.0, 8.0)
+            
+            # 3. Heading indicator triangle
+            if self.gps_heading is not None and self.gps_heading != 0.0:
+                painter.translate(px, py)
+                painter.rotate(self.gps_heading)
+                arrow = QPolygonF([
+                    QPointF(0, -14),
+                    QPointF(-5, -7),
+                    QPointF(5, -7)
+                ])
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#3B82F6"))
+                painter.drawPolygon(arrow)
+                
             painter.restore()
             
         # Draw "Rendering..." overlay if background thread is active
@@ -1761,11 +1847,20 @@ class MainWindow(QMainWindow):
         self.map_widget.status_message.connect(self.status_bar.showMessage)
         self.map_widget.route_start_changed.connect(self.on_route_start_changed)
         self.map_widget.route_end_changed.connect(self.on_route_end_changed)
+        self.map_widget.route_completed_signal.connect(self.on_mainwindow_route_completed)
+        self.map_widget.route_failed_signal.connect(self.on_mainwindow_route_failed)
         self.map_widget.search_requested.connect(self.on_search_requested)
         
         self.desc_a = ""
         self.desc_b = ""
         self.all_search_names = []
+        
+        # GPS & Navigation state
+        self.active_gps_device = None
+        self.available_gps_devices = GPSRegistry.get_available_devices()
+        
+        # TTS Alert Manager
+        self.tts_manager = TTSManager(self)
         
         # Toolbar controls setup
         self.toolbar = QToolBar("Controls")
@@ -1821,6 +1916,47 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.btn_clear_route)
         
         self.toolbar.addSeparator()
+        
+        # GPS & Navigation toolbar
+        self.gps_toolbar = QToolBar("GPS & Navigation")
+        self.gps_toolbar.setObjectName("GPSToolbar")
+        self.gps_toolbar.setIconSize(self.gps_toolbar.iconSize() * 0.8)
+        self.addToolBar(self.gps_toolbar)
+        
+        self.lbl_gps = QLabel(" GPS:")
+        self.lbl_gps.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        self.gps_toolbar.addWidget(self.lbl_gps)
+        
+        self.combo_gps = QComboBox()
+        self.combo_gps.setMinimumWidth(220)
+        self.combo_gps.addItem("None (Disabled)")
+        for dev in self.available_gps_devices:
+            self.combo_gps.addItem(dev.get_name())
+        self.combo_gps.currentIndexChanged.connect(self.on_gps_device_changed)
+        self.gps_toolbar.addWidget(self.combo_gps)
+        
+        self.gps_toolbar.addSeparator()
+        
+        self.btn_start_nav = QPushButton("▶ Start Nav")
+        self.btn_start_nav.clicked.connect(self.start_navigation)
+        self.btn_start_nav.setEnabled(False)
+        self.gps_toolbar.addWidget(self.btn_start_nav)
+        
+        self.btn_pause_nav = QPushButton("⏸ Pause Nav")
+        self.btn_pause_nav.clicked.connect(self.pause_navigation)
+        self.btn_pause_nav.setEnabled(False)
+        self.gps_toolbar.addWidget(self.btn_pause_nav)
+        
+        self.btn_stop_nav = QPushButton("⏹ Cancel Nav")
+        self.btn_stop_nav.clicked.connect(self.cancel_navigation)
+        self.btn_stop_nav.setEnabled(False)
+        self.gps_toolbar.addWidget(self.btn_stop_nav)
+        
+        self.btn_toggle_center = QPushButton("🎯 Auto-Center")
+        self.btn_toggle_center.setCheckable(True)
+        self.btn_toggle_center.setChecked(True)
+        self.btn_toggle_center.clicked.connect(self.on_toggle_center_clicked)
+        self.gps_toolbar.addWidget(self.btn_toggle_center)
         
         # (Toolbar Dev config button removed)
         
@@ -1912,9 +2048,20 @@ class MainWindow(QMainWindow):
             has_routing = getattr(self.map_widget, "has_routing", False)
             self.combo_profile.setEnabled(has_routing)
             self.btn_clear_route.setEnabled(has_routing)
+            self.combo_gps.setEnabled(True)
+            # Only enable Start Nav if a route actually exists and a GPS is active
+            route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route) > 0
+            gps_active = self.active_gps_device is not None
+            self.btn_start_nav.setEnabled(route_exists and gps_active)
+            self.btn_pause_nav.setEnabled(self.map_widget.navigation_state == "navigating" and gps_active)
+            self.btn_stop_nav.setEnabled(self.map_widget.navigation_state != "inactive")
         else:
             self.combo_profile.setEnabled(False)
             self.btn_clear_route.setEnabled(False)
+            self.combo_gps.setEnabled(False)
+            self.btn_start_nav.setEnabled(False)
+            self.btn_pause_nav.setEnabled(False)
+            self.btn_stop_nav.setEnabled(False)
 
     def on_data_load_error(self, err_msg):
         self.set_controls_enabled(True)
@@ -2299,7 +2446,25 @@ class MainWindow(QMainWindow):
     def clear_route(self):
         """
         Clears all selected route markers and paths.
+        Also cancels any active navigation process.
         """
+        if self.map_widget.navigation_state != "inactive":
+            self.map_widget.navigation_state = "inactive"
+            if self.active_gps_device is not None:
+                try:
+                    self.active_gps_device.stop()
+                    self.active_gps_device.update_route([])
+                except Exception as e:
+                    print("Error stopping GPS on route clear:", e)
+            self.map_widget.gps_position = None
+            self.map_widget.gps_heading = 0.0
+            
+            # Reset navigation buttons
+            self.btn_start_nav.setEnabled(False)
+            self.btn_pause_nav.setEnabled(False)
+            self.btn_stop_nav.setEnabled(False)
+            self.tts_manager.reset()
+            
         self.map_widget.route_start = None
         self.map_widget.route_end = None
         self.map_widget.current_route = None
@@ -2309,8 +2474,177 @@ class MainWindow(QMainWindow):
         self.desc_a = ""
         self.desc_b = ""
         self.update_search_inputs()
-        self.status_bar.showMessage("Route cleared.")
+        self.status_bar.showMessage("Route and navigation cleared.")
         self.map_widget.update()
+
+    def on_gps_device_changed(self, index):
+        """
+        Triggered when the user selects a different GPS module from the combobox.
+        """
+        if self.active_gps_device is not None:
+            try:
+                self.active_gps_device.stop()
+                self.active_gps_device.position_updated.disconnect(self.on_gps_position_updated)
+                self.active_gps_device.status_message.disconnect(self.on_gps_status_message)
+            except Exception as e:
+                print("Error disconnecting previous GPS device:", e)
+            self.active_gps_device = None
+            
+        if index == 0:
+            self.status_bar.showMessage("GPS disabled.")
+            self.map_widget.gps_position = None
+            self.map_widget.gps_heading = 0.0
+            
+            # Update navigation button states
+            self.btn_start_nav.setEnabled(False)
+            self.btn_pause_nav.setEnabled(False)
+            self.btn_stop_nav.setEnabled(False)
+            self.map_widget.update()
+            return
+            
+        device = self.available_gps_devices[index - 1]
+        self.active_gps_device = device
+        
+        self.active_gps_device.position_updated.connect(self.on_gps_position_updated)
+        self.active_gps_device.status_message.connect(self.on_gps_status_message)
+        
+        if self.map_widget.navigation_state == "navigating":
+            self.tts_manager.align_tracking_baseline()
+            self.active_gps_device.update_route(self.map_widget.current_route)
+            self.active_gps_device.start()
+            self.btn_start_nav.setEnabled(False)
+            self.btn_pause_nav.setEnabled(True)
+            self.btn_stop_nav.setEnabled(True)
+        elif self.map_widget.navigation_state == "paused":
+            self.active_gps_device.update_route(self.map_widget.current_route)
+            self.btn_start_nav.setEnabled(True)
+            self.btn_pause_nav.setEnabled(False)
+            self.btn_stop_nav.setEnabled(True)
+        else:
+            # Active but not in navigation mode (e.g. standard tracking)
+            self.active_gps_device.start()
+            route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route) > 0
+            self.btn_start_nav.setEnabled(route_exists)
+            self.btn_pause_nav.setEnabled(False)
+            self.btn_stop_nav.setEnabled(False)
+            
+        self.status_bar.showMessage(f"Activated GPS: {device.get_name()}")
+
+    def on_gps_position_updated(self, lat, lon, speed_knots, heading, quality):
+        """
+        Receives new coordinates from the active GPS module and updates the map overlay.
+        """
+        mx, my = project_mercator(lat, lon)
+        self.map_widget.gps_position = QPointF(mx, my)
+        self.map_widget.gps_heading = heading
+        
+        speed_kmh = speed_knots * 1.852
+        quality_str = "Fix OK" if quality > 0 else "No Fix"
+        msg = f"GPS Lat: {lat:.5f}°, Lon: {lon:.5f}° | Speed: {speed_kmh:.1f} km/h | Heading: {heading:.1f}° | Status: {quality_str}"
+        self.status_bar.showMessage(msg, 5000)
+        
+        if self.map_widget.navigation_state == "navigating" and self.map_widget.auto_center_gps:
+            self.map_widget.center_x = mx
+            self.map_widget.center_y = my
+            self.map_widget.trigger_background_render()
+            
+            # Feed current position to TTS Manager to track turns and trigger alerts
+            self.tts_manager.update_navigation(
+                self.map_widget.gps_position,
+                self.map_widget.current_route,
+                self.map_widget.active_profile
+            )
+            
+        self.map_widget.update()
+
+    def on_gps_status_message(self, message):
+        self.status_bar.showMessage(f"GPS: {message}", 5000)
+
+    def on_toggle_center_clicked(self, checked):
+        self.map_widget.auto_center_gps = checked
+        if checked and self.map_widget.gps_position:
+            self.map_widget.center_x = self.map_widget.gps_position.x()
+            self.map_widget.center_y = self.map_widget.gps_position.y()
+            self.map_widget.start_interaction()
+            self.map_widget.update()
+
+    def start_navigation(self):
+        """
+        Starts or resumes route navigation and movement tracking.
+        """
+        if not self.map_widget.current_route:
+            QMessageBox.warning(self, "Navigation", "Please establish a route first.")
+            return
+            
+        self.map_widget.navigation_state = "navigating"
+        self.tts_manager.align_tracking_baseline()
+        
+        # Enable tracking buttons
+        self.btn_start_nav.setEnabled(False)
+        self.btn_pause_nav.setEnabled(True)
+        self.btn_stop_nav.setEnabled(True)
+        
+        if self.active_gps_device is not None:
+            self.active_gps_device.update_route(self.map_widget.current_route)
+            self.active_gps_device.start()
+            
+        # Center view on start of route if no current GPS coordinate is set
+        if not self.map_widget.gps_position and self.map_widget.current_route:
+            start_pt = self.map_widget.current_route[0]
+            self.map_widget.center_x = start_pt.x()
+            self.map_widget.center_y = start_pt.y()
+            self.map_widget.start_interaction()
+            self.map_widget.update()
+            
+        self.status_bar.showMessage("Navigation started.")
+
+    def pause_navigation(self):
+        """
+        Pauses active navigation movement tracking.
+        """
+        self.map_widget.navigation_state = "paused"
+        self.btn_start_nav.setEnabled(True)
+        self.btn_pause_nav.setEnabled(False)
+        self.btn_stop_nav.setEnabled(True)
+        
+        if self.active_gps_device is not None:
+            # Stopping the device stops the simulation timer or serial reads
+            self.active_gps_device.stop()
+            
+        self.status_bar.showMessage("Navigation paused.")
+
+    def cancel_navigation(self):
+        """
+        Cancels the active navigation tracking and clears routes.
+        """
+        self.clear_route()
+
+    def on_mainwindow_route_completed(self):
+        """
+        Triggered when route calculations successfully complete.
+        """
+        # If a GPS device is active, update its route cache
+        if self.active_gps_device is not None:
+            self.active_gps_device.update_route(self.map_widget.current_route)
+            
+        # Enable the Start Nav button since we now have a route path
+        if self.active_gps_device is not None:
+            self.btn_start_nav.setEnabled(True)
+        self.btn_clear_route.setEnabled(True)
+        
+        # Load route directions into TTS Manager
+        self.tts_manager.set_route_directions(
+            self.map_widget.current_route_directions,
+            self.map_widget.current_route
+        )
+
+    def on_mainwindow_route_failed(self, err_msg):
+        """
+        Triggered when route calculations fail.
+        """
+        self.btn_start_nav.setEnabled(False)
+        self.btn_pause_nav.setEnabled(False)
+        self.btn_stop_nav.setEnabled(False)
 
     def find_coordinates_for_search(self, search_text):
         """
