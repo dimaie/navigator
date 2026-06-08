@@ -6,7 +6,7 @@ import json
 import array
 import struct
 from PySide6.QtCore import Qt, QPointF, QRectF, QThread, Signal, QPoint, QTimer, QStringListModel
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QPolygonF
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QPolygonF, QPainterPath
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLineEdit, QPushButton, QLabel, QStatusBar, QToolBar, QProgressBar, 
                              QMessageBox, QCompleter, QSizePolicy, QFrame, QComboBox, QColorDialog,
@@ -195,6 +195,9 @@ class MapDataLoader(QThread):
                     if cursor.fetchone():
                         cursor.execute("SELECT lat, lon, tags FROM raw_nodes WHERE tags LIKE '%postcode%'")
                         for lat, lon, tags_json in cursor.fetchall():
+                            if self.isInterruptionRequested():
+                                conn.close()
+                                return
                             try:
                                 tags = json.loads(tags_json)
                                 pc = tags.get("addr:postcode") or tags.get("postal_code")
@@ -212,6 +215,9 @@ class MapDataLoader(QThread):
                     if cursor.fetchone():
                         cursor.execute("SELECT nodes, tags FROM raw_ways WHERE tags LIKE '%postcode%'")
                         for nodes_blob, tags_json in cursor.fetchall():
+                            if self.isInterruptionRequested():
+                                conn.close()
+                                return
                             try:
                                 tags = json.loads(tags_json)
                                 pc = tags.get("addr:postcode") or tags.get("postal_code")
@@ -278,6 +284,9 @@ class MapDataLoader(QThread):
             places_rows = cursor.fetchall()
             places = []
             for r in places_rows:
+                if self.isInterruptionRequested():
+                    conn.close()
+                    return
                 tags = {}
                 if r[6]:
                     try:
@@ -366,6 +375,9 @@ class MapDataLoader(QThread):
             
             # Add places
             for p in places:
+                if self.isInterruptionRequested():
+                    conn.close()
+                    return
                 name = p["name"]
                 county = p["county"]
                 display = f"{name}, Co. {county}" if county else name
@@ -405,6 +417,9 @@ class MapDataLoader(QThread):
             ways_rows = cursor.fetchall()
             import re
             for name, min_x, min_y, max_x, max_y in ways_rows:
+                if self.isInterruptionRequested():
+                    conn.close()
+                    return
                 wx = (min_x + max_x) / 2.0
                 wy = (min_y + max_y) / 2.0
                 nearest = find_nearest_place(wx, wy)
@@ -513,6 +528,7 @@ class MapWidget(QWidget):
         self.image_w = 0
         self.image_h = 0
         self.render_worker = None
+        self.active_workers = set()
         
         # Debounce timer for triggering background rendering when panning/zooming stops
         self.render_debounce_timer = QTimer(self)
@@ -543,6 +559,7 @@ class MapWidget(QWidget):
         self.gps_heading = 0.0    # heading in degrees clockwise from North
         self.navigation_state = "inactive"  # "inactive", "navigating", "paused"
         self.auto_center_gps = True
+        
         
         # Default modern Light Mode palette settings
         self.default_colors = constants.DEFAULT_COLORS
@@ -626,6 +643,11 @@ class MapWidget(QWidget):
             "Bicycle": {"driving_side": "left", "fallback_profile": "Walk", "distance_weight": 0.5, "speed_weight": 0.5, "prohibited_links": ["motorway", "motorway_link"], "speeds": {}, "multipliers": {}},
             "Walk": {"driving_side": "left", "fallback_profile": None, "distance_weight": 0.9, "speed_weight": 0.1, "prohibited_links": ["motorway", "motorway_link", "trunk", "trunk_link"], "speeds": {}, "multipliers": {}}
         }
+        self.navigation_settings = {
+            "vehicle_position": "center",
+            "orientation": "north_up",
+            "tts_mode": "full"
+        }
         
         if os.path.exists(constants.SETTINGS_PATH):
             try:
@@ -637,6 +659,8 @@ class MapWidget(QWidget):
                         self.zoom_details = data["zoom_details"]
                     if "routing_profiles" in data:
                         self.routing_profiles = data["routing_profiles"]
+                    if "navigation" in data:
+                        self.navigation_settings.update(data["navigation"])
             except Exception as e:
                 print("Error loading settings:", e)
                 
@@ -672,7 +696,8 @@ class MapWidget(QWidget):
                 "colors": self.colors,
                 "zoom_details": self.zoom_details,
                 "viewports": viewports,
-                "routing_profiles": routing_profiles if routing_profiles else self.routing_profiles
+                "routing_profiles": routing_profiles if routing_profiles else self.routing_profiles,
+                "navigation": self.navigation_settings
             }
             with open(constants.SETTINGS_PATH, 'w') as f:
                 json.dump(data, f, indent=4)
@@ -823,10 +848,50 @@ class MapWidget(QWidget):
     def to_mercator(self, px, py):
         """
         Converts screen pixel coordinates (X, Y) back to Web Mercator coordinates (meters).
+        Handles map rotation in Heading Up mode.
         """
-        x = self.center_x + (px - self.width() / 2.0) / self.scale
-        y = self.center_y - (py - self.height() / 2.0) / self.scale
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        
+        # If map is rotated, unrotate the screen point around the center of the screen
+        orient_mode = self.navigation_settings.get("orientation", "north_up")
+        if orient_mode == "drive_always_up" and self.navigation_state == "navigating" and self.gps_heading is not None:
+            import math
+            theta_rad = math.radians(self.gps_heading)
+            dx = px - cx
+            dy = py - cy
+            rx = dx * math.cos(theta_rad) - dy * math.sin(theta_rad)
+            ry = dx * math.sin(theta_rad) + dy * math.cos(theta_rad)
+            px = cx + rx
+            py = cy + ry
+            
+        x = self.center_x + (px - cx) / self.scale
+        y = self.center_y - (py - cy) / self.scale
         return x, y
+
+    def center_on_gps(self, mx, my, heading):
+        """
+        Centers the camera on the GPS position according to the active configurations:
+        - vehicle_position: "center" or "bottom"
+        - orientation: "north_up" or "drive_always_up"
+        """
+        pos_mode = self.navigation_settings.get("vehicle_position", "center")
+        orient_mode = self.navigation_settings.get("orientation", "north_up")
+        
+        if pos_mode == "bottom":
+            # Shift camera focus forward by 25% of screen height in Mercator meters
+            D = 0.25 * self.height() / self.scale
+            if orient_mode == "drive_always_up" and heading is not None:
+                import math
+                theta_rad = math.radians(heading)
+                self.center_x = mx + D * math.sin(theta_rad)
+                self.center_y = my + D * math.cos(theta_rad)
+            else:
+                self.center_x = mx
+                self.center_y = my + D
+        else:
+            self.center_x = mx
+            self.center_y = my
 
     def constrain_view(self):
         """
@@ -996,16 +1061,20 @@ class MapWidget(QWidget):
     # Asynchronous Off-Screen Rendering Methods
     def abort_rendering(self):
         """
-        Cancels the debounce timer and requests interruption of the worker thread.
-        Blocks until the thread is fully joined to guarantee clean shutdown.
+        Cancels the debounce timer and requests interruption of all worker threads.
+        Blocks until they are fully joined to guarantee clean shutdown.
         """
         if hasattr(self, "render_debounce_timer") and self.render_debounce_timer.isActive():
             self.render_debounce_timer.stop()
             
-        if hasattr(self, "render_worker") and self.render_worker and self.render_worker.isRunning():
-            self.render_worker.requestInterruption()
-            self.render_worker.wait()
-            self.render_worker = None
+        # Stop and join any active render workers
+        for worker in list(self.active_workers):
+            from shiboken6 import isValid
+            if isValid(worker) and worker.isRunning():
+                worker.requestInterruption()
+                worker.wait()
+        self.active_workers.clear()
+        self.render_worker = None
             
         self.rendering_in_progress = False
 
@@ -1017,7 +1086,8 @@ class MapWidget(QWidget):
         if not self.data_loaded:
             return
             
-        if hasattr(self, "render_worker") and self.render_worker and self.render_worker.isRunning():
+        from shiboken6 import isValid
+        if hasattr(self, "render_worker") and self.render_worker and isValid(self.render_worker) and self.render_worker.isRunning():
             self.pending_render_params = {
                 "width": self.width(),
                 "height": self.height(),
@@ -1031,12 +1101,17 @@ class MapWidget(QWidget):
             "places": self.places
         }
         
-        self.render_worker = MapRenderWorker(
+        worker = MapRenderWorker(
             self.width(), self.height(),
             self.center_x, self.center_y, self.scale,
             self.db_path, map_data, self.zoom_details, self.colors,
             self.frame_budget
         )
+        self.active_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self.active_workers.discard(w))
+        worker.finished.connect(lambda w=worker: setattr(self, "render_worker", None) if self.render_worker is w else None)
+        worker.finished.connect(lambda w=worker: w.deleteLater())
+        self.render_worker = worker
         self.render_worker.render_completed.connect(self.on_render_completed)
         self.rendering_in_progress = True
         self.render_worker.start()
@@ -1053,12 +1128,17 @@ class MapWidget(QWidget):
             "places": self.places
         }
         
-        self.render_worker = MapRenderWorker(
+        worker = MapRenderWorker(
             params["width"], params["height"],
             params["center_x"], params["center_y"], params["scale"],
             self.db_path, map_data, self.zoom_details, self.colors,
             self.frame_budget
         )
+        self.active_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self.active_workers.discard(w))
+        worker.finished.connect(lambda w=worker: setattr(self, "render_worker", None) if self.render_worker is w else None)
+        worker.finished.connect(lambda w=worker: w.deleteLater())
+        self.render_worker = worker
         self.render_worker.render_completed.connect(self.on_render_completed)
         self.rendering_in_progress = True
         self.render_worker.start()
@@ -1325,17 +1405,23 @@ class MapWidget(QWidget):
         if not self.has_routing or not self.route_start or not self.route_end:
             return
             
-        if hasattr(self, "routing_worker") and self.routing_worker and self.routing_worker.isRunning():
+        from shiboken6 import isValid
+        if hasattr(self, "routing_worker") and self.routing_worker and isValid(self.routing_worker) and self.routing_worker.isRunning():
             return
             
         db_path = self.db_path
         profile_name = getattr(self, "active_profile_name", "Car")
         
-        self.routing_worker = RoutingWorker(
+        worker = RoutingWorker(
             self.route_start, self.route_end,
             self.routing_graph, self.routing_nodes_coords,
             db_path, profile_name, self.routing_profiles
         )
+        self.active_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self.active_workers.discard(w))
+        worker.finished.connect(lambda w=worker: setattr(self, "routing_worker", None) if self.routing_worker is w else None)
+        worker.finished.connect(lambda w=worker: w.deleteLater())
+        self.routing_worker = worker
         self.routing_worker.graph_loaded.connect(self.on_graph_loaded)
         self.routing_worker.route_completed.connect(self.on_route_completed)
         self.routing_worker.route_failed.connect(self.on_route_failed)
@@ -1508,6 +1594,16 @@ class MapWidget(QWidget):
                 painter.drawText(self.rect(), Qt.AlignCenter, constants.STR_NO_MAP_PROMPT)
             return
             
+        # Check map rotation (Heading Up mode)
+        orient_mode = self.navigation_settings.get("orientation", "north_up")
+        is_rotated = (orient_mode == "drive_always_up" and self.navigation_state == "navigating" and self.gps_heading is not None)
+        
+        if is_rotated:
+            painter.save()
+            painter.translate(self.width() / 2.0, self.height() / 2.0)
+            painter.rotate(-self.gps_heading)
+            painter.translate(-self.width() / 2.0, -self.height() / 2.0)
+            
         # Draw pre-rendered map image
         if self.map_image:
             painter.save()
@@ -1547,38 +1643,54 @@ class MapWidget(QWidget):
         if self.route_start:
             px, py = self.to_screen(self.route_start.x(), self.route_start.y())
             painter.save()
+            if is_rotated:
+                painter.translate(px, py)
+                painter.rotate(self.gps_heading)
+                draw_at_x, draw_at_y = 0.0, 0.0
+            else:
+                draw_at_x, draw_at_y = px, py
+                
             painter.setPen(QPen(QColor("#FFFFFF"), 2.0))
             painter.setBrush(QColor("#10B981"))
-            painter.drawEllipse(QPointF(px, py), 8.0, 8.0)
+            painter.drawEllipse(QPointF(draw_at_x, draw_at_y), 8.0, 8.0)
             painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
             painter.setPen(QColor("#FFFFFF"))
-            painter.drawText(QRectF(px - 10, py - 10, 20, 20), Qt.AlignCenter, "A")
+            painter.drawText(QRectF(draw_at_x - 10, draw_at_y - 10, 20, 20), Qt.AlignCenter, "A")
             painter.restore()
             
         if self.route_end:
             px, py = self.to_screen(self.route_end.x(), self.route_end.y())
             painter.save()
+            if is_rotated:
+                painter.translate(px, py)
+                painter.rotate(self.gps_heading)
+                draw_at_x, draw_at_y = 0.0, 0.0
+            else:
+                draw_at_x, draw_at_y = px, py
+                
             painter.setPen(QPen(QColor("#FFFFFF"), 2.0))
             painter.setBrush(QColor("#EF4444"))
-            painter.drawEllipse(QPointF(px, py), 8.0, 8.0)
+            painter.drawEllipse(QPointF(draw_at_x, draw_at_y), 8.0, 8.0)
             painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
             painter.setPen(QColor("#FFFFFF"))
-            painter.drawText(QRectF(px - 10, py - 10, 20, 20), Qt.AlignCenter, "B")
+            painter.drawText(QRectF(draw_at_x - 10, draw_at_y - 10, 20, 20), Qt.AlignCenter, "B")
             painter.restore()
             
         # Draw GPS position marker
-        if self.gps_position:
+        # "The vehicle symbol must only appear in the navigation mode, while 'active' or 'paused', its colour must be distinguishable from the route."
+        # Route color is blue #3B82F6. Distinguishable color chosen: Orange #FF6B00.
+        if self.gps_position and self.navigation_state in ("navigating", "paused"):
             px, py = self.to_screen(self.gps_position.x(), self.gps_position.y())
             painter.save()
             
-            # 1. Outer accuracy glow ring
-            painter.setPen(QPen(QColor(59, 130, 246, 50), 1.5))
-            painter.setBrush(QColor(59, 130, 246, 30))
+            # 1. Outer accuracy glow ring (distinguishable orange)
+            painter.setPen(QPen(QColor(255, 107, 0, 50), 1.5))
+            painter.setBrush(QColor(255, 107, 0, 30))
             painter.drawEllipse(QPointF(px, py), 18.0, 18.0)
             
-            # 2. Main blue dot with white border
+            # 2. Main orange dot with white border
             painter.setPen(QPen(QColor("#FFFFFF"), 2.0))
-            painter.setBrush(QColor("#3B82F6"))
+            painter.setBrush(QColor("#FF6B00"))
             painter.drawEllipse(QPointF(px, py), 8.0, 8.0)
             
             # 3. Heading indicator triangle
@@ -1591,13 +1703,17 @@ class MapWidget(QWidget):
                     QPointF(5, -7)
                 ])
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor("#3B82F6"))
+                painter.setBrush(QColor("#FF6B00"))
                 painter.drawPolygon(arrow)
                 
             painter.restore()
             
-        # Draw "Rendering..." overlay if background thread is active
-        if hasattr(self, "render_worker") and self.render_worker and self.render_worker.isRunning():
+        if is_rotated:
+            painter.restore()
+            
+        # Draw "Rendering..." overlay if background thread is active and NOT in navigating state
+        from shiboken6 import isValid
+        if hasattr(self, "render_worker") and self.render_worker and isValid(self.render_worker) and self.render_worker.isRunning() and self.navigation_state != "navigating":
             painter.save()
             margin_right = 20
             margin_top = 20
@@ -1611,6 +1727,165 @@ class MapWidget(QWidget):
             painter.setPen(QColor("#FFFFFF"))
             painter.drawText(rect, Qt.AlignCenter, "⏳ RENDERING...")
             painter.restore()
+
+        # Draw Navigation Overlay (Next and After-Next Action Panels)
+        # Always available in executing ("navigating") or paused ("paused") mode
+        if self.navigation_state in ("navigating", "paused") and self.parent() and hasattr(self.parent(), "tts_manager"):
+            tts = self.parent().tts_manager
+            next_action = getattr(tts, "next_action", None)
+            next_dist = getattr(tts, "next_action_distance", 0.0)
+            after_action = getattr(tts, "after_next_action", None)
+            after_dist = getattr(tts, "after_next_action_distance", 0.0)
+            
+            if next_action:
+                painter.save()
+                painter.setRenderHint(QPainter.Antialiasing)
+                
+                # --- 1. Draw Next Action (Big Panel) ---
+                margin_left = 20
+                margin_top = 20
+                panel_w = 280
+                panel_h = 75
+                
+                rect_next = QRectF(margin_left, margin_top, panel_w, panel_h)
+                
+                # Glassmorphism dark background (slate-800 with 220 alpha)
+                painter.setPen(QPen(QColor(255, 255, 255, 40), 1.0))
+                painter.setBrush(QColor(15, 23, 42, 220))
+                painter.drawRoundedRect(rect_next, 12.0, 12.0)
+                
+                # Draw Arrow
+                arrow_rect = QRectF(margin_left + 15, margin_top + 17, 40, 40)
+                next_angle = self.parse_turn_angle(next_action.get("speakable_action", ""))
+                self.draw_turn_arrow(painter, arrow_rect, next_angle, QColor("#FFFFFF"), 4.0)
+                
+                # Draw Next Action Details
+                text_left = margin_left + 70
+                available_text_w = panel_w - 85
+                
+                # Distance text (Vibrant Orange, bold)
+                painter.setFont(QFont("Segoe UI", 12, QFont.Bold))
+                painter.setPen(QColor("#FF6B00"))
+                dist_str = self.format_nav_distance(next_dist)
+                painter.drawText(text_left, margin_top + 28, dist_str)
+                
+                # Action instruction description text (White, semi-bold, elided)
+                painter.setFont(QFont("Segoe UI", 9, QFont.Medium))
+                painter.setPen(QColor("#FFFFFF"))
+                action_text = next_action.get("speakable_action", "")
+                metrics = QFontMetrics(painter.font())
+                elided_action = metrics.elidedText(action_text, Qt.ElideRight, available_text_w)
+                painter.drawText(text_left, margin_top + 48, elided_action)
+                
+                # --- 2. Draw Action After Next (Smaller Panel) ---
+                if after_action:
+                    small_panel_w = 220
+                    small_panel_h = 52
+                    small_margin_top = margin_top + panel_h + 10
+                    
+                    rect_after = QRectF(margin_left, small_margin_top, small_panel_w, small_panel_h)
+                    
+                    # Glassmorphism dark background
+                    painter.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
+                    painter.setBrush(QColor(15, 23, 42, 220))
+                    painter.drawRoundedRect(rect_after, 8.0, 8.0)
+                    
+                    # Draw Arrow (smaller)
+                    small_arrow_rect = QRectF(margin_left + 10, small_margin_top + 11, 30, 30)
+                    after_angle = self.parse_turn_angle(after_action.get("speakable_action", ""))
+                    self.draw_turn_arrow(painter, small_arrow_rect, after_angle, QColor("#FFFFFF"), 3.0)
+                    
+                    # Draw Action After Next Details
+                    small_text_left = margin_left + 50
+                    available_small_w = small_panel_w - 60
+                    
+                    # Distance text (Muted White/Orange, bold)
+                    painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+                    painter.setPen(QColor("#FFA15A"))  # Slightly softer orange
+                    after_dist_str = self.format_nav_distance(after_dist)
+                    painter.drawText(small_text_left, small_margin_top + 22, after_dist_str)
+                    
+                    # Action description text (Muted White, normal, elided)
+                    painter.setFont(QFont("Segoe UI", 8))
+                    painter.setPen(QColor("#E2E8F0"))
+                    after_text = after_action.get("speakable_action", "")
+                    small_metrics = QFontMetrics(painter.font())
+                    elided_after = small_metrics.elidedText(after_text, Qt.ElideRight, available_small_w)
+                    painter.drawText(small_text_left, small_margin_top + 38, elided_after)
+                    
+                painter.restore()
+
+    def parse_turn_angle(self, text):
+        if not text:
+            return 0
+        text_lower = text.lower()
+        if "sharp left" in text_lower:
+            return -135
+        elif "sharp right" in text_lower:
+            return 135
+        elif "turn left" in text_lower:
+            return -90
+        elif "turn right" in text_lower:
+            return 90
+        elif "bear left" in text_lower:
+            return -45
+        elif "bear right" in text_lower:
+            return 45
+        return 0
+
+    def format_nav_distance(self, dist_meters):
+        if dist_meters < 1000.0:
+            return f"{int(dist_meters)} m"
+        else:
+            return f"{dist_meters / 1000.0:.1f} km"
+
+    def draw_turn_arrow(self, painter, rect, angle, color, thickness):
+        cx = rect.center().x()
+        cy = rect.center().y()
+        w = rect.width()
+        h = rect.height()
+        
+        path = QPainterPath()
+        # Shaft start at bottom
+        start_pt = QPointF(cx, cy + h * 0.3)
+        path.moveTo(start_pt)
+        # Go up to middle
+        mid_pt = QPointF(cx, cy)
+        path.lineTo(mid_pt)
+        
+        if angle != 0:
+            import math
+            theta_rad = math.radians(angle)
+            length = h * 0.4
+            end_pt = QPointF(cx + length * math.sin(theta_rad), cy - length * math.cos(theta_rad))
+            
+            # Draw a Bezier curve from mid_pt to end_pt
+            control_pt = QPointF(cx, cy - h * 0.25)
+            path.quadTo(control_pt, end_pt)
+        else:
+            end_pt = QPointF(cx, cy - h * 0.4)
+            path.lineTo(end_pt)
+            
+        # Draw the shaft path
+        pen = QPen(color, thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(path)
+        
+        # Draw the arrowhead at end_pt rotated by angle
+        painter.save()
+        painter.translate(end_pt)
+        painter.rotate(angle)
+        arrowhead = QPolygonF([
+            QPointF(0, -thickness * 1.5),
+            QPointF(-thickness * 1.0, 0),
+            QPointF(thickness * 1.0, 0)
+        ])
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        painter.drawPolygon(arrowhead)
+        painter.restore()
+
 import preprocess
 
 class PreprocessorWorker(QThread):
@@ -1813,6 +2088,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(constants.STR_APP_TITLE_BASE)
         self.resize(1200, 850)
         self.db_path = db_path
+        self.active_workers = set()
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1976,7 +2252,12 @@ class MainWindow(QMainWindow):
                 self.set_controls_enabled(False)
                 QTimer.singleShot(100, self.convert_pbf_on_startup)
             else:
-                self.loader = MapDataLoader(self.db_path, self.map_widget.zoom_details)
+                loader = MapDataLoader(self.db_path, self.map_widget.zoom_details)
+                self.active_workers.add(loader)
+                loader.finished.connect(lambda w=loader: self.active_workers.discard(w))
+                loader.finished.connect(lambda w=loader: setattr(self, "loader", None) if self.loader is w else None)
+                loader.finished.connect(lambda w=loader: w.deleteLater())
+                self.loader = loader
                 self.loader.progress_message.connect(self.show_loading_status)
                 self.loader.progress_pct.connect(self.update_load_progress)
                 self.loader.data_loaded.connect(self.on_data_loaded)
@@ -2277,7 +2558,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.show()
         self.show_loading_status(constants.STR_CONVERT_STARTING)
         
-        self.prep_worker = PreprocessorWorker(pbf_path, db_path)
+        worker = PreprocessorWorker(pbf_path, db_path)
+        self.active_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self.active_workers.discard(w))
+        worker.finished.connect(lambda w=worker: setattr(self, "prep_worker", None) if self.prep_worker is w else None)
+        worker.finished.connect(lambda w=worker: w.deleteLater())
+        self.prep_worker = worker
         self.prep_worker.progress_update.connect(self.on_prep_progress)
         self.prep_worker.finished.connect(lambda: self.on_prep_finished(db_path))
         self.prep_worker.error.connect(self.on_prep_error)
@@ -2308,8 +2594,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "db_check_timer") and self.db_check_timer.isActive():
             self.db_check_timer.stop()
             
-        if hasattr(self, "loader") and self.loader and self.loader.isRunning():
-            self.loader.terminate()
+        from shiboken6 import isValid
+        if hasattr(self, "loader") and self.loader and isValid(self.loader) and self.loader.isRunning():
+            self.loader.requestInterruption()
             self.loader.wait()
             
         self.map_widget.abort_rendering()
@@ -2324,7 +2611,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.show()
         
         self.set_controls_enabled(False)
-        self.loader = MapDataLoader(self.db_path, self.map_widget.zoom_details)
+        loader = MapDataLoader(self.db_path, self.map_widget.zoom_details)
+        self.active_workers.add(loader)
+        loader.finished.connect(lambda w=loader: self.active_workers.discard(w))
+        loader.finished.connect(lambda w=loader: setattr(self, "loader", None) if self.loader is w else None)
+        loader.finished.connect(lambda w=loader: w.deleteLater())
+        self.loader = loader
         self.loader.progress_message.connect(self.show_loading_status)
         self.loader.progress_pct.connect(self.update_load_progress)
         self.loader.data_loaded.connect(self.on_data_loaded)
@@ -2543,16 +2835,18 @@ class MainWindow(QMainWindow):
         msg = f"GPS Lat: {lat:.5f}°, Lon: {lon:.5f}° | Speed: {speed_kmh:.1f} km/h | Heading: {heading:.1f}° | Status: {quality_str}"
         self.status_bar.showMessage(msg, 5000)
         
-        if self.map_widget.navigation_state == "navigating" and self.map_widget.auto_center_gps:
-            self.map_widget.center_x = mx
-            self.map_widget.center_y = my
-            self.map_widget.trigger_background_render()
-            
-            # Feed current position to TTS Manager to track turns and trigger alerts
+        if self.map_widget.navigation_state == "navigating":
+            if self.map_widget.auto_center_gps:
+                self.map_widget.center_on_gps(mx, my, heading)
+                self.map_widget.trigger_background_render()
+                
+        # Always feed current position to TTS Manager to track turns and update overlays when navigating or paused
+        if self.map_widget.navigation_state in ("navigating", "paused"):
             self.tts_manager.update_navigation(
                 self.map_widget.gps_position,
                 self.map_widget.current_route,
-                self.map_widget.active_profile
+                self.map_widget.active_profile,
+                self.map_widget.navigation_settings.get("tts_mode", "full")
             )
             
         self.map_widget.update()
@@ -2567,6 +2861,8 @@ class MainWindow(QMainWindow):
             self.map_widget.center_y = self.map_widget.gps_position.y()
             self.map_widget.start_interaction()
             self.map_widget.update()
+
+
 
     def start_navigation(self):
         """
@@ -2591,10 +2887,20 @@ class MainWindow(QMainWindow):
         # Center view on start of route if no current GPS coordinate is set
         if not self.map_widget.gps_position and self.map_widget.current_route:
             start_pt = self.map_widget.current_route[0]
+            self.map_widget.gps_position = start_pt
             self.map_widget.center_x = start_pt.x()
             self.map_widget.center_y = start_pt.y()
             self.map_widget.start_interaction()
             self.map_widget.update()
+            
+        # Initialize overlays immediately
+        if self.map_widget.gps_position:
+            self.tts_manager.update_navigation(
+                self.map_widget.gps_position,
+                self.map_widget.current_route,
+                self.map_widget.active_profile,
+                self.map_widget.navigation_settings.get("tts_mode", "full")
+            )
             
         self.status_bar.showMessage("Navigation started.")
 

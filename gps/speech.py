@@ -114,6 +114,10 @@ class TTSManager(QObject):
         self.prev_dist_to_turn = None
         self.prev_step_idx = -1
         self.last_speak_time = 0.0
+        self.next_action = None
+        self.next_action_distance = 0.0
+        self.after_next_action = None
+        self.after_next_action_distance = 0.0
         
     def _refresh_audio_source(self):
         """Checks if ding-dong.mp3 exists and configures the appropriate player."""
@@ -132,6 +136,10 @@ class TTSManager(QObject):
         self.prev_dist_to_turn = None
         self.prev_step_idx = -1
         self.last_speak_time = 0.0
+        self.next_action = None
+        self.next_action_distance = 0.0
+        self.after_next_action = None
+        self.after_next_action_distance = 0.0
         if self.tts.state() == QTextToSpeech.State.Speaking:
             self.tts.stop()
             
@@ -203,11 +211,14 @@ class TTSManager(QObject):
                 best_proj = proj
         return best_idx, best_proj
 
-    def update_navigation(self, gps_pt, route_points, active_profile):
+    def update_navigation(self, gps_pt, route_points, active_profile, tts_mode="full"):
         """
         Tracks vehicle progression against the next navigation step.
         Spoken notifications or beep alerts are triggered when transitioning across distance thresholds.
         """
+        if tts_mode == "disabled":
+            return
+            
         if not route_points or not self.navigation_steps:
             return
             
@@ -230,6 +241,20 @@ class TTSManager(QObject):
         junc_idx = next_step["junc_idx"]
         pts_remaining = [snapped_gps] + route_points[gps_idx + 1 : junc_idx + 1]
         dist_to_turn = get_ground_distance(pts_remaining)
+        
+        # Update current action and distance info for MapWidget visualization
+        self.next_action = next_step
+        self.next_action_distance = dist_to_turn
+        
+        self.after_next_action = None
+        self.after_next_action_distance = 0.0
+        if next_step_idx + 1 < len(self.navigation_steps):
+            step_after = self.navigation_steps[next_step_idx + 1]
+            junc_idx_after = step_after["junc_idx"]
+            pts_between = route_points[junc_idx : junc_idx_after + 1]
+            dist_between = get_ground_distance(pts_between)
+            self.after_next_action = step_after
+            self.after_next_action_distance = dist_to_turn + dist_between
         
         # Reset tracking parameters if the turn has changed
         if next_step_idx != self.prev_step_idx:
@@ -267,22 +292,30 @@ class TTSManager(QObject):
             for t in crossed_thresholds:
                 self.notified_distances[next_step_idx].add(t)
                 
-            # Check if TTS is busy (either active speaking or within cooldown)
-            import time
-            current_time = time.time()
-            cooldown = 6.0  # seconds required to notify in full
-            is_speaking = (self.tts.state() == QTextToSpeech.State.Speaking)
-            in_cooldown = (current_time - self.last_speak_time < cooldown)
-            is_busy = is_speaking or in_cooldown
+            # Only turns/roundabout actions must be announced
+            action_text = next_step.get("speakable_action", "")
+            is_turn = any(k in action_text.lower() for k in ["turn", "bear", "roundabout", "sharp"])
             
-            # Play beep if busy or if a threshold was skipped
-            if is_busy or skipped:
-                self.play_beep()
-                
-            if not is_busy:
-                # Say the instruction
-                text = f"In {int(chosen_threshold)} meters, {next_step['speakable_action']}"
-                self.speak(text)
-                self.last_speak_time = current_time
+            if is_turn:
+                if tts_mode == "sound_only":
+                    self.play_beep()
+                elif tts_mode == "full":
+                    # Check if TTS is busy (either active speaking or within cooldown)
+                    import time
+                    current_time = time.time()
+                    cooldown = 6.0  # seconds required to notify in full
+                    is_speaking = (self.tts.state() == QTextToSpeech.State.Speaking)
+                    in_cooldown = (current_time - self.last_speak_time < cooldown)
+                    is_busy = is_speaking or in_cooldown
+                    
+                    # Play beep if busy or if a threshold was skipped
+                    if is_busy or skipped:
+                        self.play_beep()
+                        
+                    if not is_busy:
+                        # Say the instruction
+                        text = f"In {int(chosen_threshold)} meters, {next_step['speakable_action']}"
+                        self.speak(text)
+                        self.last_speak_time = current_time
             
         self.prev_dist_to_turn = dist_to_turn
