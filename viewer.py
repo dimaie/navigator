@@ -23,7 +23,7 @@ SETTINGS_PATH = r"./config.json"
 
 from utils import inverse_mercator, simplify_path, project_mercator
 from render_worker import MapRenderWorker
-from routing_worker import RoutingWorker
+from routing_worker import RoutingWorker, ComputedRoute
 from gps import GPSRegistry
 from gps.speech import TTSManager
 
@@ -508,6 +508,7 @@ class MapWidget(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         
+        self.main_window = parent
         # Camera & Navigation states
         self.center_x = 0.0           # Camera focus center in Web Mercator X meters
         self.center_y = 0.0           # Camera focus center in Web Mercator Y meters
@@ -546,11 +547,8 @@ class MapWidget(QWidget):
         self.has_routing = False
         self.route_start = None
         self.route_end = None
-        self.current_route = None
+        self.current_route = None   # ComputedRoute or None
         self.route_mode = False
-        self.route_distance = 0.0
-        self.route_duration = 0.0
-        self.current_route_directions = []
         self.active_profile = {"use_speed": False, "multipliers": {}}
         self.db_path = None
         
@@ -1349,12 +1347,12 @@ class MapWidget(QWidget):
             self.show_route_directions()
 
     def show_route_directions(self):
-        if not self.current_route_directions:
+        if not self.current_route or not self.current_route.directions:
             QMessageBox.information(self, "Directions", "No route directions available.")
             return
             
         driving_side = self.active_profile.get("driving_side", "left")
-        dialog = RouteDirectionsDialog(self.current_route_directions, driving_side, self)
+        dialog = RouteDirectionsDialog(self.current_route.directions, driving_side, self)
         dialog.exec()
 
     def handle_map_click(self, px, py):
@@ -1370,8 +1368,6 @@ class MapWidget(QWidget):
         if self.route_start is None:
             self.route_start = click_pt
             self.current_route = None
-            self.route_distance = 0.0
-            self.route_duration = 0.0
             
             desc = self.find_nearest_address(mx, my)
             self.route_start_changed.emit(click_pt, desc)
@@ -1389,8 +1385,6 @@ class MapWidget(QWidget):
             self.route_start = click_pt
             self.route_end = None
             self.current_route = None
-            self.route_distance = 0.0
-            self.route_duration = 0.0
             
             desc = self.find_nearest_address(mx, my)
             self.route_start_changed.emit(click_pt, desc)
@@ -1431,16 +1425,13 @@ class MapWidget(QWidget):
         self.routing_graph = graph
         self.routing_nodes_coords = coords
         
-    def on_route_completed(self, pts, dist, duration, graph, coords, used_profile, directions):
-        self.current_route = pts
-        self.route_distance = dist
-        self.route_duration = duration
+    def on_route_completed(self, route, graph, coords):
+        self.current_route = route
         self.routing_graph = graph
         self.routing_nodes_coords = coords
-        self.current_route_directions = directions
         
-        dist_km = dist / 1000.0
-        dur_mins = duration / 60.0
+        dist_km = route.distance_m / 1000.0
+        dur_mins = route.duration_s / 60.0
         if dur_mins >= 60.0:
             dur_hours = int(dur_mins // 60)
             dur_mins_rem = int(dur_mins % 60)
@@ -1450,8 +1441,8 @@ class MapWidget(QWidget):
             
         profile_msg = ""
         active_name = getattr(self, "active_profile_name", "Car")
-        if used_profile != active_name:
-            profile_msg = f" (via fallback: {used_profile})"
+        if route.profile_name != active_name:
+            profile_msg = f" (via fallback: {route.profile_name})"
             
         msg = f"Route calculated: {dist_km:.1f} km ({dur_str}){profile_msg}"
         self.status_message.emit(msg)
@@ -1462,7 +1453,6 @@ class MapWidget(QWidget):
 
     def on_route_failed(self, err_msg):
         self.route_end = None
-        self.current_route_directions = []
         self.status_message.emit(err_msg)
         QMessageBox.warning(self, "Routing Failed", err_msg)
         self.update()
@@ -1631,7 +1621,7 @@ class MapWidget(QWidget):
             painter.scale(self.scale, -self.scale)
             painter.translate(-self.center_x, -self.center_y)
             
-            poly = QPolygonF(self.current_route)
+            poly = QPolygonF(self.current_route.points)
             pen = QPen(QColor("#3B82F6"), 6.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
             pen.setCosmetic(True)
             painter.setPen(pen)
@@ -1730,8 +1720,9 @@ class MapWidget(QWidget):
 
         # Draw Navigation Overlay (Next and After-Next Action Panels)
         # Always available in executing ("navigating") or paused ("paused") mode
-        if self.navigation_state in ("navigating", "paused") and self.parent() and hasattr(self.parent(), "tts_manager"):
-            tts = self.parent().tts_manager
+        main_window = getattr(self, "main_window", None)
+        if self.navigation_state in ("navigating", "paused") and main_window and hasattr(main_window, "tts_manager"):
+            tts = main_window.tts_manager
             next_action = getattr(tts, "next_action", None)
             next_dist = getattr(tts, "next_action_distance", 0.0)
             after_action = getattr(tts, "after_next_action", None)
@@ -1931,7 +1922,8 @@ class RouteDirectionsDialog(QDialog):
         self.text_edit = QPlainTextEdit()
         self.text_edit.setReadOnly(True)
         self.text_edit.setFont(QFont("Consolas" if sys.platform == "win32" else "Monospace", 10))
-        self.text_edit.setStyleSheet("background-color: #FAFAFA; border: 1px solid #DDD; padding: 5px;")
+        self.text_edit.viewport().setStyleSheet("background-color: #FAFAFA; padding: 5px;")
+        self.text_edit.setStyleSheet("border: 1px solid #DDD;")
         
         self.text_edit.setPlainText("\n\n".join(directions))
         layout.addWidget(self.text_edit)
@@ -2331,7 +2323,7 @@ class MainWindow(QMainWindow):
             self.btn_clear_route.setEnabled(has_routing)
             self.combo_gps.setEnabled(True)
             # Only enable Start Nav if a route actually exists and a GPS is active
-            route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route) > 0
+            route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route.points) > 0
             gps_active = self.active_gps_device is not None
             self.btn_start_nav.setEnabled(route_exists and gps_active)
             self.btn_pause_nav.setEnabled(self.map_widget.navigation_state == "navigating" and gps_active)
@@ -2629,8 +2621,6 @@ class MainWindow(QMainWindow):
             pt, desc, scale = res
             self.map_widget.route_start = pt
             self.map_widget.current_route = None
-            self.map_widget.route_distance = 0.0
-            self.map_widget.route_duration = 0.0
             
             self.desc_a = desc
             self.update_search_inputs()
@@ -2656,8 +2646,6 @@ class MainWindow(QMainWindow):
             pt, desc, scale = res
             self.map_widget.route_end = pt
             self.map_widget.current_route = None
-            self.map_widget.route_distance = 0.0
-            self.map_widget.route_duration = 0.0
             
             self.desc_b = desc
             self.update_search_inputs()
@@ -2760,9 +2748,6 @@ class MainWindow(QMainWindow):
         self.map_widget.route_start = None
         self.map_widget.route_end = None
         self.map_widget.current_route = None
-        self.map_widget.route_distance = 0.0
-        self.map_widget.route_duration = 0.0
-        self.map_widget.current_route_directions = []
         self.desc_a = ""
         self.desc_b = ""
         self.update_search_inputs()
@@ -2802,20 +2787,20 @@ class MainWindow(QMainWindow):
         
         if self.map_widget.navigation_state == "navigating":
             self.tts_manager.align_tracking_baseline()
-            self.active_gps_device.update_route(self.map_widget.current_route)
+            self.active_gps_device.update_route(self.map_widget.current_route.points)
             self.active_gps_device.start()
             self.btn_start_nav.setEnabled(False)
             self.btn_pause_nav.setEnabled(True)
             self.btn_stop_nav.setEnabled(True)
         elif self.map_widget.navigation_state == "paused":
-            self.active_gps_device.update_route(self.map_widget.current_route)
+            self.active_gps_device.update_route(self.map_widget.current_route.points)
             self.btn_start_nav.setEnabled(True)
             self.btn_pause_nav.setEnabled(False)
             self.btn_stop_nav.setEnabled(True)
         else:
             # Active but not in navigation mode (e.g. standard tracking)
             self.active_gps_device.start()
-            route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route) > 0
+            route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route.points) > 0
             self.btn_start_nav.setEnabled(route_exists)
             self.btn_pause_nav.setEnabled(False)
             self.btn_stop_nav.setEnabled(False)
@@ -2844,7 +2829,7 @@ class MainWindow(QMainWindow):
         if self.map_widget.navigation_state in ("navigating", "paused"):
             self.tts_manager.update_navigation(
                 self.map_widget.gps_position,
-                self.map_widget.current_route,
+                self.map_widget.current_route.points,
                 self.map_widget.active_profile,
                 self.map_widget.navigation_settings.get("tts_mode", "full")
             )
@@ -2881,12 +2866,12 @@ class MainWindow(QMainWindow):
         self.btn_stop_nav.setEnabled(True)
         
         if self.active_gps_device is not None:
-            self.active_gps_device.update_route(self.map_widget.current_route)
+            self.active_gps_device.update_route(self.map_widget.current_route.points)
             self.active_gps_device.start()
             
         # Center view on start of route if no current GPS coordinate is set
         if not self.map_widget.gps_position and self.map_widget.current_route:
-            start_pt = self.map_widget.current_route[0]
+            start_pt = self.map_widget.current_route.points[0]
             self.map_widget.gps_position = start_pt
             self.map_widget.center_x = start_pt.x()
             self.map_widget.center_y = start_pt.y()
@@ -2897,7 +2882,7 @@ class MainWindow(QMainWindow):
         if self.map_widget.gps_position:
             self.tts_manager.update_navigation(
                 self.map_widget.gps_position,
-                self.map_widget.current_route,
+                self.map_widget.current_route.points,
                 self.map_widget.active_profile,
                 self.map_widget.navigation_settings.get("tts_mode", "full")
             )
@@ -2931,7 +2916,7 @@ class MainWindow(QMainWindow):
         """
         # If a GPS device is active, update its route cache
         if self.active_gps_device is not None:
-            self.active_gps_device.update_route(self.map_widget.current_route)
+            self.active_gps_device.update_route(self.map_widget.current_route.points)
             
         # Enable the Start Nav button since we now have a route path
         if self.active_gps_device is not None:
@@ -2940,8 +2925,8 @@ class MainWindow(QMainWindow):
         
         # Load route directions into TTS Manager
         self.tts_manager.set_route_directions(
-            self.map_widget.current_route_directions,
-            self.map_widget.current_route
+            self.map_widget.current_route.directions,
+            self.map_widget.current_route.points
         )
 
     def on_mainwindow_route_failed(self, err_msg):

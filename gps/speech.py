@@ -215,9 +215,8 @@ class TTSManager(QObject):
         """
         Tracks vehicle progression against the next navigation step.
         Spoken notifications or beep alerts are triggered when transitioning across distance thresholds.
+        Visual HUD state (next_action, after_next_action) is always updated regardless of tts_mode.
         """
-        if tts_mode == "disabled":
-            return
             
         if not route_points or not self.navigation_steps:
             return
@@ -266,11 +265,16 @@ class TTSManager(QObject):
             self.prev_dist_to_turn = dist_to_turn
             return
             
-        # 4. Fetch the target notification distances from profile configuration
+        # 4. Skip audio notifications if TTS is disabled
+        if tts_mode == "disabled":
+            self.prev_dist_to_turn = dist_to_turn
+            return
+
+        # 5. Fetch the target notification distances from profile configuration
         target_distances = active_profile.get("tts_distances", [500, 200, 50])
         target_distances = sorted(list(target_distances), reverse=True)
         
-        # 5. Detect crossed thresholds
+        # 6. Detect crossed thresholds
         crossed_thresholds = []
         if next_step_idx not in self.notified_distances:
             self.notified_distances[next_step_idx] = set()

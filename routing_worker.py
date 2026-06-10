@@ -5,8 +5,28 @@ import struct
 import array
 import math
 import heapq
+from dataclasses import dataclass, field
 from PySide6.QtCore import QThread, Signal, QPointF
 from utils import inverse_mercator
+
+
+@dataclass
+class ComputedRoute:
+    """
+    Encapsulates the complete result of a successful A* pathfinding operation.
+
+    Attributes:
+        points:       Ordered list of QPointF Web Mercator coordinates forming the route polyline.
+        distance_m:   Total route length in metres.
+        duration_s:   Estimated travel time in seconds.
+        directions:   Human-readable turn-by-turn instruction strings.
+        profile_name: Name of the routing profile (or fallback) that produced this route.
+    """
+    points:       list = field(default_factory=list)   # list[QPointF]
+    distance_m:   float = 0.0
+    duration_s:   float = 0.0
+    directions:   list = field(default_factory=list)   # list[str]
+    profile_name: str  = ""
 
 
 def get_ground_distance(pts):
@@ -139,7 +159,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
     """
     Finds the shortest/fastest path between start_coord and end_coord in Web Mercator coordinates.
     - profile: dict containing weighting and speed parameters.
-    Returns (route_points, total_distance_meters, total_time_seconds)
+    Returns a ComputedRoute on success, or None on failure.
     """
     # Direct path routing for very close points
     direct_meters = get_ground_distance([start_coord, end_coord])
@@ -152,7 +172,12 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
         dur_str = f"{max(1, int(dur_mins))}m" if dur_mins < 60.0 else f"{int(dur_mins // 60)}h {int(dur_mins % 60)}m"
         len_str = f"{direct_meters/1000.0:.1f} km" if direct_meters >= 1000.0 else f"{int(direct_meters)} m"
         directions.append(f"\nTotal route length: {len_str} (Estimated travel time: {dur_str})")
-        return [start_coord, end_coord], direct_meters, total_seconds, directions
+        return ComputedRoute(
+            points=[start_coord, end_coord],
+            distance_m=direct_meters,
+            duration_s=total_seconds,
+            directions=directions,
+        )
 
     # Parse profile values
     distance_weight = profile.get("distance_weight", 1.0)
@@ -306,7 +331,12 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                 dur_str = f"{max(1, int(dur_mins))}m" if dur_mins < 60.0 else f"{int(dur_mins // 60)}h {int(dur_mins % 60)}m"
                 len_str = f"{direct_meters/1000.0:.1f} km" if direct_meters >= 1000.0 else f"{int(direct_meters)} m"
                 directions.append(f"\nTotal route length: {len_str} (Estimated travel time: {dur_str})")
-                return [start_coord, end_coord], direct_meters, total_seconds, directions
+                return ComputedRoute(
+                    points=[start_coord, end_coord],
+                    distance_m=direct_meters,
+                    duration_s=total_seconds,
+                    directions=directions,
+                )
             
             if oneway == 0:
                 g[-1].append((-2, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"]))
@@ -408,7 +438,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                     heapq.heappush(pq, (f_score, v))
                     
         if not found:
-            return None, 0.0, 0.0, []
+            return None
             
         # Reconstruct transitions sequence (from_node, to_node, edge_id)
         transitions = []
@@ -677,7 +707,12 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
         dur_str = f"{max(1, int(dur_mins))}m" if dur_mins < 60.0 else f"{int(dur_mins // 60)}h {int(dur_mins % 60)}m"
         len_str = f"{total_meters/1000.0:.1f} km" if total_meters >= 1000.0 else f"{int(total_meters)} m"
         directions.append(f"\nTotal route length: {len_str} (Estimated travel time: {dur_str})")
-        return route_points, total_meters, total_seconds, directions
+        return ComputedRoute(
+            points=route_points,
+            distance_m=total_meters,
+            duration_s=total_seconds,
+            directions=directions,
+        )
     finally:
         conn.close()
 
@@ -687,7 +722,7 @@ class RoutingWorker(QThread):
     Background worker thread that lazily loads the routing graph on-demand
     and calculates path calculations using A* search.
     """
-    route_completed = Signal(object, float, float, object, object, str, list) # points, distance, duration, graph, coords, used_profile, directions
+    route_completed = Signal(object, object, object)  # ComputedRoute, graph, coords
     route_failed = Signal(str)
     graph_loaded = Signal(object, object) # Emitted immediately when graph completes lazy-loading
     
@@ -746,14 +781,14 @@ class RoutingWorker(QThread):
                     break
                     
                 print(f"Attempting pathfinding with profile: {curr_profile_name}")
-                res = find_route_astar(
+                route = find_route_astar(
                     self.start_coord, self.end_coord,
                     self.routing_graph, self.routing_nodes_coords,
                     self.db_path, profile_dict
                 )
-                pts, dist, duration, directions = res
-                if pts:
-                    self.route_completed.emit(pts, dist, duration, self.routing_graph, self.routing_nodes_coords, curr_profile_name, directions)
+                if route is not None:
+                    route.profile_name = curr_profile_name
+                    self.route_completed.emit(route, self.routing_graph, self.routing_nodes_coords)
                     return
                     
                 # Try fallback profile
