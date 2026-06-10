@@ -268,3 +268,68 @@ elif ftype == "boundary":
 ```
 To adjust road drawing scales, modify `zoom_details` inside [constants.py](file:///c:/Work/Maps/constants.py#L51-L58) or [dev_settings.json](file:///c:/Work/Maps/dev_settings.json#L33-L64).
 
+---
+
+## 9. Testing
+
+> [!IMPORTANT]
+> **All new features, bug fixes, and refactors must be accompanied by relevant tests.**
+> A pull request or commit that changes behaviour in any module listed below without adding or updating tests will not be accepted.
+
+### A. Test Suite Location
+
+All tests live in the [`tests/`](file:///c:/Work/Maps/tests/) directory and are run with `pytest` from the project root:
+
+```bash
+pytest tests/ -v
+```
+
+### B. Required Dependencies
+
+```bash
+pip install pytest pytest-qt pytest-cov
+```
+
+`pytest-qt` provides the `qtbot` and `qapp` fixtures used by widget and GPS tests.
+
+### C. Test File Map
+
+| Module(s) | Test File |
+|---|---|
+| `utils.py` | `tests/test_utils.py` |
+| `rules.py` | `tests/test_rules.py` |
+| `routing_worker.py` — pure helpers | `tests/test_routing_helpers.py` |
+| `routing_worker.py` — A* pathfinder | `tests/test_routing_astar.py` |
+| `routing_preprocess.py` | `tests/test_routing_preprocess.py` |
+| `gps/speech.py` | `tests/test_tts_navigation.py` |
+| `gps/mock_gps.py` | `tests/test_mock_gps.py` |
+| `viewer.py` — `MapWidget` | `tests/test_map_widget.py` |
+
+Shared fixtures (synthetic routing DB, route points, profile dicts) are defined in [`tests/conftest.py`](file:///c:/Work/Maps/tests/conftest.py).
+
+### D. What Must Be Tested
+
+When adding or changing a feature, include tests that cover:
+
+- **Happy path** — the normal, expected input produces the correct output.
+- **Edge cases** — empty inputs, boundary values, degenerate geometry (e.g. zero-length segment, single-point list).
+- **Failure modes** — invalid input returns `None`, `False`, raises an expected exception, or emits the correct error signal.
+- **State transitions** — for stateful components (e.g. `TTSManager`, `MockGPSDevice`, `MapWidget`) verify that state is correctly set, reset, and that the right Qt signals are emitted.
+
+### E. Testing Rules
+
+1. **No placeholders.** Every `test_` function must contain at least one real assertion against real logic. `assert True` and `pass`-only tests are forbidden.
+2. **No production database.** Tests must never open or depend on `ireland-and-northern-ireland-*.db`. Use `tmp_path` fixtures or `:memory:` SQLite databases.
+3. **Mock all audio hardware.** Tests for `TTSManager` must patch `QTextToSpeech`, `QMediaPlayer`, `QSoundEffect`, and `QAudioOutput` with `unittest.mock.patch` so they run without audio devices.
+4. **Parametrize repeated patterns.** Use `@pytest.mark.parametrize` for any test that asserts the same logic over multiple inputs (e.g. road type → width, place type → font style).
+5. **Descriptive names.** Test functions must follow the convention `test_<what>_<condition>_<expected_outcome>` (e.g. `test_get_road_width_interacting_residential_returns_zero`).
+
+### F. Coverage
+
+Run with coverage to check which lines are exercised:
+
+```bash
+pytest tests/ --cov=. --cov-report=term-missing
+```
+
+New code is expected to maintain or improve the overall line coverage percentage. Significant drops in coverage introduced by a feature branch are a review concern.
