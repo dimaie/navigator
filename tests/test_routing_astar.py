@@ -29,18 +29,18 @@ def _build_graph_from_db(db_path):
     cursor.execute("SELECT id, x, y FROM routing_nodes")
     coords = {nid: (x, y) for nid, x, y in cursor.fetchall()}
 
-    cursor.execute("SELECT id, from_node, to_node, length, way_type, name, oneway FROM routing_edges")
+    cursor.execute("SELECT id, from_node, to_node, length, way_type, name, oneway, is_roundabout FROM routing_edges")
     graph = {}
-    for eid, u, v, length, wtype, name, oneway in cursor.fetchall():
+    for eid, u, v, length, wtype, name, oneway, is_rab in cursor.fetchall():
         graph.setdefault(u, [])
         graph.setdefault(v, [])
         if oneway == 0:
-            graph[u].append((v, length, eid, wtype, name))
-            graph[v].append((u, length, eid, wtype, name))
+            graph[u].append((v, length, eid, wtype, name, is_rab))
+            graph[v].append((u, length, eid, wtype, name, is_rab))
         elif oneway == 1:
-            graph[u].append((v, length, eid, wtype, name))
+            graph[u].append((v, length, eid, wtype, name, is_rab))
         elif oneway == -1:
-            graph[v].append((u, length, eid, wtype, name))
+            graph[v].append((u, length, eid, wtype, name, is_rab))
 
     conn.close()
     return graph, coords

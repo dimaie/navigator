@@ -20,13 +20,59 @@ class ComputedRoute:
         distance_m:   Total route length in metres.
         duration_s:   Estimated travel time in seconds.
         directions:   Human-readable turn-by-turn instruction strings.
+        steps:        Structured per-step metadata for TTS and HUD rendering.
+                      Each entry is a dict with keys:
+                        type            – "turn" | "roundabout" | "continue" | "destination"
+                        angle           – signed float degrees; negative=right, positive=left, 0=straight
+                        junction_choices– int: accessible outgoing roads at the junction (excl. arrival)
+                                          1 = forced (no real choice), >1 = genuine decision
+                        exit_number     – int: which exit to take (roundabout only)
+                        total_exits     – int: total exits on the roundabout ring (roundabout only)
+                        junc_pt         – QPointF: Mercator coordinates of the junction / exit point
+                        speakable       – bool: True when TTS should announce this step
+                        speakable_action– str: ready-to-speak instruction text
+                        driving_side    – str: "left" | "right" from the active profile
         profile_name: Name of the routing profile (or fallback) that produced this route.
     """
     points:       list = field(default_factory=list)   # list[QPointF]
     distance_m:   float = 0.0
     duration_s:   float = 0.0
     directions:   list = field(default_factory=list)   # list[str]
+    steps:        list = field(default_factory=list)   # list[dict]
     profile_name: str  = ""
+
+
+class GraphOverlay:
+    def __init__(self, base_graph, g_minus_1, g_minus_2, g_modified):
+        self.base_graph = base_graph
+        self.g_minus_1 = g_minus_1
+        self.g_minus_2 = g_minus_2
+        self.g_modified = g_modified
+
+    def __contains__(self, key):
+        if key == -1 or key == -2:
+            return True
+        if key in self.g_modified:
+            return True
+        return key in self.base_graph
+
+    def __getitem__(self, key):
+        if key == -1:
+            return self.g_minus_1
+        if key == -2:
+            return self.g_minus_2
+        if key in self.g_modified:
+            return self.g_modified[key]
+        return self.base_graph[key]
+
+    def get(self, key, default=None):
+        if key == -1:
+            return self.g_minus_1
+        if key == -2:
+            return self.g_minus_2
+        if key in self.g_modified:
+            return self.g_modified[key]
+        return self.base_graph.get(key, default)
 
 
 def get_ground_distance(pts):
@@ -229,7 +275,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
             # 2. Query edges connected to these nodes
             placeholders = ",".join("?" for _ in node_ids)
             cursor.execute(f"""
-                SELECT id, from_node, to_node, length, way_type, name, oneway, coords 
+                SELECT id, from_node, to_node, length, way_type, name, oneway, is_roundabout, coords 
                 FROM routing_edges
                 WHERE from_node IN ({placeholders}) OR to_node IN ({placeholders})
             """, node_ids + node_ids)
@@ -241,7 +287,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
             best_pts = []
             
             for row in cursor.fetchall():
-                eid, f_node, t_node, length, wtype, name, oneway, blob = row
+                eid, f_node, t_node, length, wtype, name, oneway, is_rab, blob = row
                 coords = array.array('d', blob)
                 pts = [QPointF(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
                 
@@ -251,7 +297,8 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                         min_dist2 = d2
                         best_edge = {
                             "id": eid, "from_node": f_node, "to_node": t_node,
-                            "length": length, "way_type": wtype, "name": name, "oneway": oneway
+                            "length": length, "way_type": wtype, "name": name, "oneway": oneway,
+                            "is_roundabout": is_rab
                         }
                         best_proj = proj
                         best_proj_idx = i
@@ -270,16 +317,23 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
         ex, ey = proj_b.x(), proj_b.y()
         
         # 2. In-memory virtual graph creation
-        # Clone graph and coords to prevent modifying cache
-        g = {k: list(v) for k, v in routing_graph.items()}
-        coords = dict(routing_nodes_coords)
+        # Avoid cloning huge dictionaries
+        g_minus_1 = []
+        g_minus_2 = []
+        g_modified = {}
         
-        # Set coordinates for virtual nodes
-        coords[-1] = (sx, sy)
-        coords[-2] = (ex, ey)
-        
-        g[-1] = []
-        g[-2] = []
+        def add_edge_to_g(from_node, to_node, length, edge_id, way_type, name, is_rab):
+            if from_node == -1:
+                g_minus_1.append((to_node, length, edge_id, way_type, name, is_rab))
+            elif from_node == -2:
+                g_minus_2.append((to_node, length, edge_id, way_type, name, is_rab))
+            else:
+                if from_node not in g_modified:
+                    g_modified[from_node] = list(routing_graph.get(from_node, []))
+                g_modified[from_node].append((to_node, length, edge_id, way_type, name, is_rab))
+                
+        g = GraphOverlay(routing_graph, g_minus_1, g_minus_2, g_modified)
+        coords_overlay = {-1: (sx, sy), -2: (ex, ey)}
         
         # Helper to calculate split ratios for edge lengths
         def get_split_lengths(edge, pts, proj, idx):
@@ -339,20 +393,20 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                 )
             
             if oneway == 0:
-                g[-1].append((-2, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"]))
-                g[-2].append((-1, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"]))
+                add_edge_to_g(-1, -2, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
+                add_edge_to_g(-2, -1, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
             elif oneway == 1:
                 if a_before_b:
-                    g[-1].append((-2, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"]))
+                    add_edge_to_g(-1, -2, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
                 else:
-                    g[-1].append((v, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
-                    g[u].append((-2, l_u_end, edge_a["id"], edge_a["way_type"], edge_a["name"]))
+                    add_edge_to_g(-1, v, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
+                    add_edge_to_g(u, -2, l_u_end, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
             elif oneway == -1:
                 if not a_before_b:
-                    g[-1].append((-2, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"]))
+                    add_edge_to_g(-1, -2, dist_ab, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
                 else:
-                    g[-1].append((u, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
-                    g[v].append((-2, l_v_end, edge_a["id"], edge_a["way_type"], edge_a["name"]))
+                    add_edge_to_g(-1, u, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
+                    add_edge_to_g(v, -2, l_v_end, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
         else:
             # Different edges routing
             l_u_start, l_v_start = get_split_lengths(edge_a, pts_a, proj_a, idx_a)
@@ -360,38 +414,41 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
             oneway_a = edge_a["oneway"]
             
             if oneway_a == 0:
-                g[-1].append((u_a, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
-                g[u_a].append((-1, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
-                g[-1].append((v_a, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
-                g[v_a].append((-1, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
+                add_edge_to_g(-1, u_a, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
+                add_edge_to_g(u_a, -1, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
+                add_edge_to_g(-1, v_a, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
+                add_edge_to_g(v_a, -1, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
             elif oneway_a == 1:
-                g[-1].append((v_a, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
-                g[u_a].append((-1, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
+                add_edge_to_g(-1, v_a, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
+                add_edge_to_g(u_a, -1, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
             elif oneway_a == -1:
-                g[-1].append((u_a, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
-                g[v_a].append((-1, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"]))
+                add_edge_to_g(-1, u_a, l_u_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
+                add_edge_to_g(v_a, -1, l_v_start, edge_a["id"], edge_a["way_type"], edge_a["name"], edge_a["is_roundabout"])
                 
             l_u_end, l_v_end = get_split_lengths(edge_b, pts_b, proj_b, idx_b)
             u_b, v_b = edge_b["from_node"], edge_b["to_node"]
             oneway_b = edge_b["oneway"]
             
             if oneway_b == 0:
-                g[-2].append((u_b, l_u_end, edge_b["id"], edge_b["way_type"], edge_b["name"]))
-                g[u_b].append((-2, l_u_end, edge_b["id"], edge_b["way_type"], edge_b["name"]))
-                g[-2].append((v_b, l_v_end, edge_b["id"], edge_b["way_type"], edge_b["name"]))
-                g[v_b].append((-2, l_v_end, edge_b["id"], edge_b["way_type"], edge_b["name"]))
+                add_edge_to_g(-2, u_b, l_u_end, edge_b["id"], edge_b["way_type"], edge_b["name"], edge_b["is_roundabout"])
+                add_edge_to_g(u_b, -2, l_u_end, edge_b["id"], edge_b["way_type"], edge_b["name"], edge_b["is_roundabout"])
+                add_edge_to_g(-2, v_b, l_v_end, edge_b["id"], edge_b["way_type"], edge_b["name"], edge_b["is_roundabout"])
+                add_edge_to_g(v_b, -2, l_v_end, edge_b["id"], edge_b["way_type"], edge_b["name"], edge_b["is_roundabout"])
             elif oneway_b == 1:
-                g[u_b].append((-2, l_u_end, edge_b["id"], edge_b["way_type"], edge_b["name"]))
-                g[-2].append((v_b, l_v_end, edge_b["id"], edge_b["way_type"], edge_b["name"]))
+                add_edge_to_g(u_b, -2, l_u_end, edge_b["id"], edge_b["way_type"], edge_b["name"], edge_b["is_roundabout"])
+                add_edge_to_g(-2, v_b, l_v_end, edge_b["id"], edge_b["way_type"], edge_b["name"], edge_b["is_roundabout"])
             elif oneway_b == -1:
-                g[v_b].append((-2, l_v_end, edge_b["id"], edge_b["way_type"], edge_b["name"]))
-                g[-2].append((u_b, l_u_end, edge_b["id"], edge_b["way_type"], edge_b["name"]))
+                add_edge_to_g(v_b, -2, l_v_end, edge_b["id"], edge_b["way_type"], edge_b["name"], edge_b["is_roundabout"])
+                add_edge_to_g(-2, u_b, l_u_end, edge_b["id"], edge_b["way_type"], edge_b["name"], edge_b["is_roundabout"])
 
         # Heuristic function using dynamically computed min_cost_per_meter
         def get_heuristic(node_id):
-            if node_id not in coords:
+            if node_id in coords_overlay:
+                nx, ny = coords_overlay[node_id]
+            elif node_id in routing_nodes_coords:
+                nx, ny = routing_nodes_coords[node_id]
+            else:
                 return 0.0
-            nx, ny = coords[node_id]
             dist = math.sqrt((nx - ex)**2 + (ny - ey)**2)
             return dist * min_cost_per_meter
             
@@ -417,7 +474,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
             if u not in g:
                 continue
                 
-            for v, length, edge_id, way_type, name in g[u]:
+            for v, length, edge_id, way_type, name, is_rab in g[u]:
                 if v in visited:
                     continue
                 if way_type in prohibited_links:
@@ -541,7 +598,10 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
             route_points = [start_coord, end_coord]
             
         # Leg Grouping
+        # Also capture the last edge id and the actual end node per leg for junction-choice counting.
         legs = []
+        leg_last_edge_id = []  # parallel to legs: edge_id of the last transition in each leg
+        leg_end_node_id  = []  # parallel to legs: the node at the end of each leg
         for u, v, edge_id in transitions:
             if edge_id not in edge_data:
                 continue
@@ -556,6 +616,15 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                 
             length = data["length"]
             pts = data["pts"]
+            
+            # Determine actual traversal direction to resolve end node
+            # (virtual nodes -1, -2 never appear as the permanent junction end node)
+            if v >= 0:
+                real_end_node = v
+            elif u >= 0:
+                real_end_node = u
+            else:
+                real_end_node = -1   # start==-1, end==-2 (single-edge route)
             
             sub_pts = []
             if u == -1 and v == -2:
@@ -588,6 +657,9 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                         legs[-1]["pts"].append(pt)
                 if is_rab:
                     legs[-1]["nodes"].append(v)
+                # Update last-edge info for this merged leg
+                leg_last_edge_id[-1] = edge_id
+                leg_end_node_id[-1]  = real_end_node
             else:
                 legs.append({
                     "name": norm_name,
@@ -596,40 +668,85 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                     "is_roundabout": is_rab,
                     "nodes": [u, v] if is_rab else []
                 })
+                leg_last_edge_id.append(edge_id)
+                leg_end_node_id.append(real_end_node)
                 
-        # Generate directions
+        # Generate directions and structured step metadata
         directions = []
+        steps = []
+        driving_side = profile.get("driving_side", "left")
+        
+        def _count_junction_choices_mem(node_id, incoming_edge_id):
+            """
+            Counts genuine outgoing road choices at node_id using the in-memory
+            adjacency list, excluding the incoming edge and roundabout/prohibited edges.
+            No SQL round-trip needed — g already holds the full graph.
+            """
+            count = 0
+            for (neighbor, _length, eid, way_type, _name, is_rab) in g.get(node_id, []):
+                if eid == incoming_edge_id:
+                    continue  # exclude the road we arrived on
+                if way_type in prohibited_links:
+                    continue
+                if is_rab:
+                    continue  # exclude roundabout arcs
+                count += 1
+            return count
+        
+        def _traverse_roundabout_ring_mem(entry_node):
+            """
+            BFS on the in-memory adjacency list, following only roundabout edges,
+            to collect all node IDs on the full ring.
+            No SQL queries needed — is_roundabout is pre-loaded in graph tuples.
+            """
+            visited = {entry_node}
+            queue = [entry_node]
+            while queue:
+                node = queue.pop(0)
+                for (neighbor, _length, eid, _wtype, _name, is_rab) in g.get(node, []):
+                    if is_rab and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            return visited
+
+        def _count_roundabout_exits_mem(ring_nodes):
+            """
+            Counts non-roundabout, non-prohibited exit arms across all ring nodes
+            using the in-memory adjacency list.
+            """
+            total = 0
+            for node in ring_nodes:
+                for (_neighbor, _length, eid, way_type, _name, is_rab) in g.get(node, []):
+                    if way_type in prohibited_links:
+                        continue
+                    if not is_rab:
+                        total += 1
+            return max(total, 1)
+
         if legs:
-            for i in range(len(legs)):
-                leg = legs[i]
+            for i, leg in enumerate(legs):
                 name = leg["name"]
                 length = leg["length"]
                 pts = leg["pts"]
+                last_eid  = leg_last_edge_id[i]
+                end_node  = leg_end_node_id[i]
                 
                 if leg.get("is_roundabout", False):
-                    # Count exits
-                    exit_count = 1
                     rab_nodes = leg["nodes"]
-                    proh_list = list(prohibited_links)
-                    placeholders = ",".join("?" for _ in proh_list)
                     
-                    # Skip the entry node (rab_nodes[0]) when counting intermediate exits
+                    # Exit number: count exits passed at intermediate nodes using in-memory graph
+                    exit_count = 1
                     for node in rab_nodes[1:-1]:
-                        query = """
-                            SELECT COUNT(*) FROM routing_edges 
-                            WHERE (
-                                (from_node = ? AND oneway >= 0) OR 
-                                (to_node = ? AND oneway <= 0)
-                            ) 
-                            AND is_roundabout = 0
-                        """
-                        if proh_list:
-                            query += f" AND way_type NOT IN ({placeholders})"
-                        
-                        cursor.execute(query, [node, node] + proh_list)
-                        count = cursor.fetchone()[0]
-                        exit_count += count
-                        
+                        for (_nb, _l, eid, wtype, _nm, is_rab) in g.get(node, []):
+                            if wtype in prohibited_links:
+                                continue
+                            if not is_rab:
+                                exit_count += 1
+                    
+                    # Total exits: BFS the full ring using in-memory graph
+                    ring_nodes  = _traverse_roundabout_ring_mem(rab_nodes[0])
+                    total_exits = _count_roundabout_exits_mem(ring_nodes)
+                    
                     if exit_count == 1:
                         suffix = "1st"
                     elif exit_count == 2:
@@ -645,37 +762,59 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                     
                     direction = f"- At the roundabout, take the {suffix} exit onto {next_name} at ({exit_lat:.5f}, {exit_lon:.5f})"
                     directions.append(direction)
+                    steps.append({
+                        "type":             "roundabout",
+                        "angle":            0.0,
+                        "junction_choices": 0,
+                        "exit_number":      exit_count,
+                        "total_exits":      total_exits,
+                        "junc_pt":          QPointF(exit_pt.x(), exit_pt.y()),
+                        "speakable":        True,
+                        "speakable_action": f"At the roundabout, take the {suffix} exit onto {next_name}",
+                        "driving_side":     driving_side,
+                    })
                 else:
                     if i == len(legs) - 1:
                         dest_pt = pts[-1]
                         dest_lat, dest_lon = inverse_mercator(dest_pt.x(), dest_pt.y())
                         direction = f"- Drive on {name} for {int(length)} m to destination at ({dest_lat:.5f}, {dest_lon:.5f})"
                         directions.append(direction)
+                        steps.append({
+                            "type":             "destination",
+                            "angle":            0.0,
+                            "junction_choices": 0,
+                            "exit_number":      0,
+                            "total_exits":      0,
+                            "junc_pt":          QPointF(dest_pt.x(), dest_pt.y()),
+                            "speakable":        False,
+                            "speakable_action": "Arrive at destination",
+                            "driving_side":     driving_side,
+                        })
                     else:
                         next_leg = legs[i+1]
                         next_name = next_leg["name"]
                         J = pts[-1]
                         
                         P_in = get_look_ahead_point(pts, is_exiting=False, target_dist=25.0)
-                            
                         next_pts = next_leg["pts"]
                         P_out = get_look_ahead_point(next_pts, is_exiting=True, target_dist=25.0)
-                            
+                        
                         v_in_x = J.x() - P_in.x()
                         v_in_y = J.y() - P_in.y()
                         v_out_x = P_out.x() - J.x()
                         v_out_y = P_out.y() - J.y()
                         
-                        len_in = math.sqrt(v_in_x**2 + v_in_y**2)
+                        len_in  = math.sqrt(v_in_x**2 + v_in_y**2)
                         len_out = math.sqrt(v_out_x**2 + v_out_y**2)
                         
+                        angle = 0.0
                         if len_in < 1e-9 or len_out < 1e-9:
                             turn_type = "continue straight"
                         else:
                             dx1, dy1 = v_in_x / len_in, v_in_y / len_in
                             dx2, dy2 = v_out_x / len_out, v_out_y / len_out
                             
-                            dot = dx1 * dx2 + dy1 * dy2
+                            dot   = dx1 * dx2 + dy1 * dy2
                             cross = dx1 * dy2 - dy1 * dx2
                             angle = math.degrees(math.atan2(cross, dot))
                             
@@ -693,13 +832,32 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
                                 turn_type = "turn right"
                             else:
                                 turn_type = "make a sharp right turn"
-                                
+                        
+                        # Count genuine outgoing choices at junction node J using in-memory graph
+                        junction_choices = _count_junction_choices_mem(end_node, last_eid) \
+                                           if end_node >= 0 else 1
+                        
+                        is_real_turn = (turn_type != "continue straight")
+                        speakable    = is_real_turn and (junction_choices > 1)
+                        step_type    = "turn" if is_real_turn else "continue"
+                        
                         junc_lat, junc_lon = inverse_mercator(J.x(), J.y())
                         if turn_type == "continue straight":
                             direction = f"- Drive on {name} for {int(length)} m and continue onto {next_name} at ({junc_lat:.5f}, {junc_lon:.5f})"
                         else:
                             direction = f"- Drive on {name} for {int(length)} m and {turn_type} to {next_name} at ({junc_lat:.5f}, {junc_lon:.5f})"
                         directions.append(direction)
+                        steps.append({
+                            "type":             step_type,
+                            "angle":            angle,
+                            "junction_choices": junction_choices,
+                            "exit_number":      0,
+                            "total_exits":      0,
+                            "junc_pt":          QPointF(J.x(), J.y()),
+                            "speakable":        speakable,
+                            "speakable_action": f"Drive on {name} for {int(length)} m and {turn_type} to {next_name}",
+                            "driving_side":     driving_side,
+                        })
         else:
             directions = ["- Proceed to destination"]
             
@@ -712,6 +870,7 @@ def find_route_astar(start_coord, end_coord, routing_graph, routing_nodes_coords
             distance_m=total_meters,
             duration_s=total_seconds,
             directions=directions,
+            steps=steps,
         )
     finally:
         conn.close()
@@ -751,9 +910,9 @@ class RoutingWorker(QThread):
                     loaded_coords[nid] = (rx, ry)
                     
                 # Retrieve edges
-                cursor.execute("SELECT id, from_node, to_node, length, way_type, name, oneway FROM routing_edges")
+                cursor.execute("SELECT id, from_node, to_node, length, way_type, name, oneway, is_roundabout FROM routing_edges")
                 loaded_graph = {}
-                for edge_id, u, v, length, wtype, rname, oneway in cursor.fetchall():
+                for edge_id, u, v, length, wtype, rname, oneway, is_rab in cursor.fetchall():
                     if u not in loaded_graph:
                         loaded_graph[u] = []
                     if v not in loaded_graph:
@@ -761,12 +920,12 @@ class RoutingWorker(QThread):
                         
                     # oneway: 0 = two-way, 1 = u->v, -1 = v->u
                     if oneway == 0:
-                        loaded_graph[u].append((v, length, edge_id, wtype, rname))
-                        loaded_graph[v].append((u, length, edge_id, wtype, rname))
+                        loaded_graph[u].append((v, length, edge_id, wtype, rname, is_rab))
+                        loaded_graph[v].append((u, length, edge_id, wtype, rname, is_rab))
                     elif oneway == 1:
-                        loaded_graph[u].append((v, length, edge_id, wtype, rname))
+                        loaded_graph[u].append((v, length, edge_id, wtype, rname, is_rab))
                     elif oneway == -1:
-                        loaded_graph[v].append((u, length, edge_id, wtype, rname))
+                        loaded_graph[v].append((u, length, edge_id, wtype, rname, is_rab))
                         
                 conn.close()
                 self.routing_graph = loaded_graph

@@ -96,11 +96,11 @@ class TestGetSpeakableAction:
 
 
 # ---------------------------------------------------------------------------
-# TTSManager.set_route_directions
+# TTSManager.set_route_directions  (legacy shim)
 # ---------------------------------------------------------------------------
 
 class TestSetRouteDirections:
-    """Tests for TTSManager.set_route_directions."""
+    """Tests for TTSManager.set_route_directions (backward-compat shim)."""
 
     def test_one_instruction_with_coordinate_adds_navigation_step(self):
         manager, _ = _make_tts_manager()
@@ -152,6 +152,100 @@ class TestSetRouteDirections:
         manager.set_route_directions(directions, route_points)
         assert len(manager.navigation_steps) == 1  # not 2
 
+    def test_shim_sets_speakable_true_for_turn_instructions(self):
+        """The legacy shim infers speakable=True for turn/bear/roundabout instructions."""
+        manager, _ = _make_tts_manager()
+        lat, lon = 53.349, -6.260
+        directions = [f"- turn left at ({lat:.5f}, {lon:.5f})"]
+        route_points = [QPointF(*project_mercator(lat, lon))]
+        manager.set_route_directions(directions, route_points)
+        assert manager.navigation_steps[0]["speakable"] is True
+
+    def test_shim_sets_speakable_false_for_continue_instructions(self):
+        """The legacy shim infers speakable=False for continue-straight instructions."""
+        manager, _ = _make_tts_manager()
+        lat, lon = 53.349, -6.260
+        directions = [f"- Drive on Main Street for 200 m and continue onto N11 at ({lat:.5f}, {lon:.5f})"]
+        route_points = [QPointF(*project_mercator(lat, lon))]
+        manager.set_route_directions(directions, route_points)
+        assert manager.navigation_steps[0]["speakable"] is False
+
+
+# ---------------------------------------------------------------------------
+# TTSManager.set_route  (structured-data path)
+# ---------------------------------------------------------------------------
+
+def _make_mock_route(steps, route_points):
+    """Builds a minimal ComputedRoute-like object with .steps and .points."""
+    class _Route:
+        pass
+    r = _Route()
+    r.steps = steps
+    r.points = route_points
+    return r
+
+
+def _make_step(junc_pt, speakable=True, step_type="turn", angle=90.0,
+               junction_choices=2, exit_number=0, total_exits=0,
+               driving_side="left", speakable_action="turn left"):
+    return {
+        "type":             step_type,
+        "angle":            angle,
+        "junction_choices": junction_choices,
+        "exit_number":      exit_number,
+        "total_exits":      total_exits,
+        "junc_pt":          junc_pt,
+        "speakable":        speakable,
+        "speakable_action": speakable_action,
+        "driving_side":     driving_side,
+    }
+
+
+class TestSetRoute:
+    """Tests for TTSManager.set_route (structured ComputedRoute path)."""
+
+    def test_set_route_loads_all_steps(self):
+        manager, _ = _make_tts_manager()
+        pts = [QPointF(float(i * 100), 0.0) for i in range(5)]
+        steps = [
+            _make_step(pts[2], speakable_action="turn left"),
+            _make_step(pts[4], speakable_action="turn right"),
+        ]
+        route = _make_mock_route(steps, pts)
+        manager.set_route(route)
+        assert len(manager.navigation_steps) == 2
+
+    def test_set_route_snaps_junc_idx_correctly(self):
+        manager, _ = _make_tts_manager()
+        pts = [QPointF(float(i * 100), 0.0) for i in range(5)]
+        step = _make_step(pts[3])
+        route = _make_mock_route([step], pts)
+        manager.set_route(route)
+        assert manager.navigation_steps[0]["junc_idx"] == 3
+
+    def test_set_route_preserves_all_metadata(self):
+        """All step dict keys survive the set_route snapping process."""
+        manager, _ = _make_tts_manager()
+        pts = [QPointF(0.0, 0.0), QPointF(100.0, 0.0)]
+        step = _make_step(pts[1], step_type="roundabout", exit_number=2,
+                          total_exits=4, speakable=True)
+        route = _make_mock_route([step], pts)
+        manager.set_route(route)
+        ns = manager.navigation_steps[0]
+        assert ns["type"] == "roundabout"
+        assert ns["exit_number"] == 2
+        assert ns["total_exits"] == 4
+        assert ns["speakable"] is True
+
+    def test_calling_set_route_twice_resets_steps(self):
+        manager, _ = _make_tts_manager()
+        pts = [QPointF(0.0, 0.0), QPointF(100.0, 0.0)]
+        step = _make_step(pts[1])
+        route = _make_mock_route([step], pts)
+        manager.set_route(route)
+        manager.set_route(route)
+        assert len(manager.navigation_steps) == 1  # not 2
+
 
 # ---------------------------------------------------------------------------
 # TTSManager.find_closest_route_index
@@ -196,6 +290,21 @@ class TestUpdateNavigation:
             "driving_side": "left",
         }
 
+    def _inject_step(self, manager, junc_idx, speakable=True,
+                     step_type="turn", speakable_action="turn left"):
+        """Directly plants a pre-built navigation step into manager."""
+        manager.navigation_steps = [{
+            "junc_idx":        junc_idx,
+            "speakable":       speakable,
+            "speakable_action": speakable_action,
+            "type":            step_type,
+            "angle":           90.0,
+            "exit_number":     0,
+            "total_exits":     0,
+            "driving_side":    "left",
+            "junc_pt":         QPointF(float(junc_idx * 100), 0.0),
+        }]
+
     def test_no_route_points_returns_immediately(self):
         manager, _ = _make_tts_manager()
         manager.speak = MagicMock()
@@ -217,10 +326,7 @@ class TestUpdateNavigation:
         manager, _ = _make_tts_manager()
         manager.speak = MagicMock()
         route = [QPointF(i * 100.0, 0.0) for i in range(10)]
-        # Place a step at route index 2, GPS is at route[9] → all steps behind GPS
-        manager.navigation_steps = [
-            {"junc_idx": 2, "speakable_action": "turn left", "original_text": "- turn left at (0,0)"}
-        ]
+        self._inject_step(manager, junc_idx=2)
         gps = QPointF(900.0, 0.0)  # beyond all steps
         manager.update_navigation(gps, route, self._make_profile())
         manager.speak.assert_not_called()
@@ -231,10 +337,7 @@ class TestUpdateNavigation:
         manager.speak = MagicMock()
         manager.play_beep = MagicMock()
         route = [QPointF(i * 100.0, 0.0) for i in range(10)]
-        manager.navigation_steps = [
-            {"junc_idx": 8, "speakable_action": "turn left", "original_text": "- turn left at (0,0)"}
-        ]
-        # prev_step_idx == -1 on fresh manager
+        self._inject_step(manager, junc_idx=8)
         assert manager.prev_step_idx == -1
         gps = QPointF(0.0, 0.0)
         manager.update_navigation(gps, route, self._make_profile())
@@ -248,9 +351,7 @@ class TestUpdateNavigation:
         manager.play_beep = MagicMock()
 
         route = [QPointF(i * 100.0, 0.0) for i in range(20)]
-        manager.navigation_steps = [
-            {"junc_idx": 15, "speakable_action": "turn left", "original_text": "- turn left at (0,0)"}
-        ]
+        self._inject_step(manager, junc_idx=15)
 
         # First call to set baseline (step changes → baseline set)
         gps_far = QPointF(0.0, 0.0)  # ~1500 m from junction
@@ -258,11 +359,10 @@ class TestUpdateNavigation:
         manager.speak.reset_mock()
         manager.play_beep.reset_mock()
 
-        # Second call: prev_step_idx already set, baseline set; simulate crossing 200m threshold
-        # Set prev_dist_to_turn manually to above threshold, dist will be < threshold
-        manager.prev_dist_to_turn = 250.0  # above 200m
+        # Second call: simulate crossing 200m threshold
+        manager.prev_dist_to_turn = 250.0
         manager.prev_step_idx = 0
-        gps_close = QPointF(1300.0, 0.0)  # ~200m from junction at 1500
+        gps_close = QPointF(1300.0, 0.0)
         manager.update_navigation(gps_close, route, self._make_profile(), tts_mode="disabled")
         manager.speak.assert_not_called()
         manager.play_beep.assert_not_called()
@@ -272,12 +372,15 @@ class TestUpdateNavigation:
         manager, _ = _make_tts_manager()
         route = [QPointF(i * 100.0, 0.0) for i in range(20)]
         manager.navigation_steps = [
-            {"junc_idx": 5,  "speakable_action": "turn left",  "original_text": "..."},
-            {"junc_idx": 12, "speakable_action": "turn right", "original_text": "..."},
+            {"junc_idx": 5,  "speakable": True, "speakable_action": "turn left",
+             "type": "turn", "angle": 90.0, "exit_number": 0, "total_exits": 0,
+             "driving_side": "left", "junc_pt": QPointF(500.0, 0.0)},
+            {"junc_idx": 12, "speakable": True, "speakable_action": "turn right",
+             "type": "turn", "angle": -90.0, "exit_number": 0, "total_exits": 0,
+             "driving_side": "left", "junc_pt": QPointF(1200.0, 0.0)},
         ]
         gps = QPointF(0.0, 0.0)
         manager.update_navigation(gps, route, self._make_profile())
-        # after_next_action should reference the second step
         assert manager.after_next_action is not None
         assert manager.after_next_action["speakable_action"] == "turn right"
 
@@ -288,16 +391,190 @@ class TestUpdateNavigation:
         manager.speak = MagicMock()
 
         route = [QPointF(i * 100.0, 0.0) for i in range(20)]
-        manager.navigation_steps = [
-            {"junc_idx": 10, "speakable_action": "turn left", "original_text": "..."},
-        ]
+        self._inject_step(manager, junc_idx=10)
 
-        # Simulate: baseline already set, prev_step_idx correct
         manager.prev_step_idx = 0
-        manager.prev_dist_to_turn = 250.0   # was 250 m, now below 200 m threshold
+        manager.prev_dist_to_turn = 250.0  # was 250 m, now below 200 m threshold
 
-        # GPS at position 800 m (junction at 1000 m → dist ~200 m)
         gps = QPointF(800.0, 0.0)
         manager.update_navigation(gps, route, self._make_profile(), tts_mode="sound_only")
-        # Beep should have been called (threshold 200 m crossed)
         manager.play_beep.assert_called()
+
+    def test_non_speakable_step_suppresses_audio_on_threshold_cross(self):
+        """Steps with speakable=False must never trigger TTS or beep."""
+        manager, _ = _make_tts_manager()
+        manager.play_beep = MagicMock()
+        manager.speak = MagicMock()
+
+        route = [QPointF(i * 100.0, 0.0) for i in range(20)]
+        self._inject_step(manager, junc_idx=10, speakable=False,
+                          speakable_action="Drive on Main St for 500 m and continue onto N11")
+
+        manager.prev_step_idx = 0
+        manager.prev_dist_to_turn = 250.0
+
+        gps = QPointF(800.0, 0.0)
+        manager.update_navigation(gps, route, self._make_profile(), tts_mode="sound_only")
+        manager.play_beep.assert_not_called()
+        manager.speak.assert_not_called()
+
+    def test_forced_turn_single_choice_suppresses_audio(self):
+        """speakable=False for forced turns (junction_choices==1) must not trigger TTS."""
+        manager, _ = _make_tts_manager()
+        manager.play_beep = MagicMock()
+        manager.speak = MagicMock()
+
+        route = [QPointF(i * 100.0, 0.0) for i in range(20)]
+        # junction_choices=1 means speakable=False at route-build time
+        manager.navigation_steps = [{
+            "junc_idx":         10,
+            "speakable":        False,   # set by router because junction_choices == 1
+            "speakable_action": "Drive on Road for 500 m and bear right to Lane",
+            "type":             "turn",
+            "angle":            -30.0,
+            "junction_choices": 1,
+            "exit_number":      0,
+            "total_exits":      0,
+            "driving_side":     "left",
+            "junc_pt":          QPointF(1000.0, 0.0),
+        }]
+
+        manager.prev_step_idx = 0
+        manager.prev_dist_to_turn = 250.0
+
+        gps = QPointF(800.0, 0.0)
+        manager.update_navigation(gps, route, self._make_profile(), tts_mode="full")
+        manager.play_beep.assert_not_called()
+        manager.speak.assert_not_called()
+
+    def test_only_one_notification_per_junction(self):
+        """Even if multiple thresholds are crossed in separate calls, TTS fires only once."""
+        manager, _ = _make_tts_manager()
+        manager.play_beep = MagicMock()
+        manager.speak = MagicMock()
+
+        route = [QPointF(i * 100.0, 0.0) for i in range(20)]
+        self._inject_step(manager, junc_idx=15)
+        manager.prev_step_idx = 0
+
+        # First crossing: 500 m → beep/speak fired
+        manager.prev_dist_to_turn = 600.0
+        manager.update_navigation(QPointF(1000.0, 0.0), route,
+                                  self._make_profile(), tts_mode="sound_only")
+        assert manager.play_beep.call_count == 1
+
+        # Second crossing: 200 m → must NOT fire again
+        manager.play_beep.reset_mock()
+        manager.prev_dist_to_turn = 250.0
+        manager.update_navigation(QPointF(1300.0, 0.0), route,
+                                  self._make_profile(), tts_mode="sound_only")
+        manager.play_beep.assert_not_called()
+
+        # Third crossing: 50 m → still must NOT fire
+        manager.play_beep.reset_mock()
+        manager.prev_dist_to_turn = 80.0
+        manager.update_navigation(QPointF(1450.0, 0.0), route,
+                                  self._make_profile(), tts_mode="sound_only")
+        manager.play_beep.assert_not_called()
+
+    def test_roundabout_pre_announced_at_approach_distance(self):
+        """
+        When next_step is a non-speakable 'continue onto roundabout' step
+        but after_next_action is a speakable roundabout exit, TTS must
+        fire using the APPROACH distance (to the entry junction), not the
+        tiny distance from inside the roundabout to the exit.
+
+        This reproduces the Station Grove -> Athlone route bug where the
+        roundabout entry and exit are only ~16 m apart.
+        """
+        manager, _ = _make_tts_manager()
+        manager.play_beep = MagicMock()
+        manager.speak = MagicMock()
+
+        # Route: 20 points at 100 m spacing.
+        # Step 0 (idx=10): continue onto roundabout - speakable=False, entry at x=1000
+        # Step 1 (idx=11): roundabout exit       - speakable=True,  exit  at x=1100
+        route = [QPointF(i * 100.0, 0.0) for i in range(20)]
+        manager.navigation_steps = [
+            {
+                "junc_idx":         10,
+                "speakable":        False,
+                "speakable_action": "Drive on unnamed road for 75 m and continue onto roundabout",
+                "type":             "continue",
+                "angle":            0.0,
+                "exit_number":      0,
+                "total_exits":      0,
+                "driving_side":     "left",
+                "junc_pt":          QPointF(1000.0, 0.0),
+            },
+            {
+                "junc_idx":         11,
+                "speakable":        True,
+                "speakable_action": "At the roundabout, take the 2nd exit onto Station Road",
+                "type":             "roundabout",
+                "angle":            0.0,
+                "exit_number":      2,
+                "total_exits":      4,
+                "driving_side":     "left",
+                "junc_pt":          QPointF(1100.0, 0.0),
+            },
+        ]
+
+        # Establish baseline: GPS at x=4 (segment 0->1), ~996 m from entry (idx=10, x=1000)
+        # prev_dist_to_turn set to 600 m (above the 500 m threshold).
+        # On this call GPS is at x=501 → dist to entry ≈ 499 m ≤ 500, crossing the threshold.
+        manager.prev_step_idx = 0
+        manager.prev_dist_to_turn = 600.0
+
+        # GPS at x=501 → snaps to segment 4->5, distance to idx=10 is ~499 m
+        gps = QPointF(501.0, 0.0)
+        manager.update_navigation(gps, route, self._make_profile(), tts_mode="sound_only")
+        assert manager.play_beep.call_count == 1, (
+            "Expected beep for roundabout pre-announcement at 500 m threshold"
+        )
+        # Roundabout exit step must be marked spoken so it never fires again
+        assert 1 in manager.spoken_steps
+
+
+    def test_non_speakable_step_with_no_speakable_after_next_stays_silent(self):
+        """
+        A non-speakable step followed by another non-speakable step
+        must never trigger any audio even when thresholds are crossed.
+        """
+        manager, _ = _make_tts_manager()
+        manager.play_beep = MagicMock()
+        manager.speak = MagicMock()
+
+        route = [QPointF(i * 100.0, 0.0) for i in range(20)]
+        manager.navigation_steps = [
+            {
+                "junc_idx":         10,
+                "speakable":        False,
+                "speakable_action": "Drive on A for 500 m and continue onto B",
+                "type":             "continue",
+                "angle":            0.0,
+                "exit_number":      0,
+                "total_exits":      0,
+                "driving_side":     "left",
+                "junc_pt":          QPointF(1000.0, 0.0),
+            },
+            {
+                "junc_idx":         15,
+                "speakable":        False,
+                "speakable_action": "Drive on B for 300 m and continue onto C",
+                "type":             "continue",
+                "angle":            0.0,
+                "exit_number":      0,
+                "total_exits":      0,
+                "driving_side":     "left",
+                "junc_pt":          QPointF(1500.0, 0.0),
+            },
+        ]
+
+        manager.prev_step_idx = 0
+        manager.prev_dist_to_turn = 600.0
+
+        gps = QPointF(100.0, 0.0)
+        manager.update_navigation(gps, route, self._make_profile(), tts_mode="sound_only")
+        manager.play_beep.assert_not_called()
+        manager.speak.assert_not_called()

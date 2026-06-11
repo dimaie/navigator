@@ -1745,10 +1745,18 @@ class MapWidget(QWidget):
                 painter.setBrush(QColor(15, 23, 42, 220))
                 painter.drawRoundedRect(rect_next, 12.0, 12.0)
                 
-                # Draw Arrow
+                # Draw Arrow or Roundabout icon
                 arrow_rect = QRectF(margin_left + 15, margin_top + 17, 40, 40)
-                next_angle = self.parse_turn_angle(next_action.get("speakable_action", ""))
-                self.draw_turn_arrow(painter, arrow_rect, next_angle, QColor("#FFFFFF"), 4.0)
+                if next_action.get("type") == "roundabout":
+                    self.draw_roundabout_icon(
+                        painter, arrow_rect,
+                        next_action.get("exit_number", 1),
+                        next_action.get("total_exits", 4),
+                        next_action.get("driving_side", "left"),
+                    )
+                else:
+                    next_angle = next_action.get("angle", 0.0)
+                    self.draw_turn_arrow(painter, arrow_rect, next_angle, QColor("#FFFFFF"), 4.0)
                 
                 # Draw Next Action Details
                 text_left = margin_left + 70
@@ -1781,10 +1789,18 @@ class MapWidget(QWidget):
                     painter.setBrush(QColor(15, 23, 42, 220))
                     painter.drawRoundedRect(rect_after, 8.0, 8.0)
                     
-                    # Draw Arrow (smaller)
+                    # Draw Arrow or Roundabout icon (smaller)
                     small_arrow_rect = QRectF(margin_left + 10, small_margin_top + 11, 30, 30)
-                    after_angle = self.parse_turn_angle(after_action.get("speakable_action", ""))
-                    self.draw_turn_arrow(painter, small_arrow_rect, after_angle, QColor("#FFFFFF"), 3.0)
+                    if after_action.get("type") == "roundabout":
+                        self.draw_roundabout_icon(
+                            painter, small_arrow_rect,
+                            after_action.get("exit_number", 1),
+                            after_action.get("total_exits", 4),
+                            after_action.get("driving_side", "left"),
+                        )
+                    else:
+                        after_angle = after_action.get("angle", 0.0)
+                        self.draw_turn_arrow(painter, small_arrow_rect, after_angle, QColor("#FFFFFF"), 3.0)
                     
                     # Draw Action After Next Details
                     small_text_left = margin_left + 50
@@ -1806,23 +1822,102 @@ class MapWidget(QWidget):
                     
                 painter.restore()
 
-    def parse_turn_angle(self, text):
-        if not text:
-            return 0
-        text_lower = text.lower()
-        if "sharp left" in text_lower:
-            return -135
-        elif "sharp right" in text_lower:
-            return 135
-        elif "turn left" in text_lower:
-            return -90
-        elif "turn right" in text_lower:
-            return 90
-        elif "bear left" in text_lower:
-            return -45
-        elif "bear right" in text_lower:
-            return 45
-        return 0
+    def draw_roundabout_icon(self, painter, rect, exit_number, total_exits, driving_side="left"):
+        """
+        Draws a roundabout diagram inside rect.
+        - A circle represents the roundabout ring.
+        - total_exits arms radiate evenly from the ring.
+        - The chosen exit arm is highlighted with a filled arrowhead and the exit number.
+        - Entry arm points downward (driver is approaching from below).
+        - For left-hand traffic (Ireland/UK) exits are numbered clockwise from entry;
+          for right-hand traffic they are anti-clockwise.
+        """
+        import math
+        cx = rect.center().x()
+        cy = rect.center().y()
+        r  = min(rect.width(), rect.height()) * 0.30   # ring radius
+        arm_len = min(rect.width(), rect.height()) * 0.38  # arm length from ring edge to tip
+        n = max(total_exits, 1)
+
+        # Entry arm points straight down (180° in Qt screen coords where 0=up)
+        # For left-hand traffic, exits are ordered clockwise; right-hand = anti-clockwise.
+        direction_sign = 1 if driving_side == "left" else -1
+        angle_step = direction_sign * (360.0 / n)
+        # Exit k=1 is the first exit after entry (clockwise for LHT)
+        # k=0 corresponds to entry (straight back), which we never label.
+        # Arm angle for exit index k: entry_angle + k * step
+        entry_angle_deg = 180.0  # pointing down
+
+        def arm_tip(k):
+            """Screen-space tip of arm k (0 = entry, 1..n = exits)."""
+            deg = entry_angle_deg + k * angle_step
+            rad = math.radians(deg)
+            tip_x = cx + (r + arm_len) * math.sin(rad)
+            tip_y = cy - (r + arm_len) * math.cos(rad)
+            ring_x = cx + r * math.sin(rad)
+            ring_y = cy - r * math.cos(rad)
+            return QPointF(ring_x, ring_y), QPointF(tip_x, tip_y)
+
+        painter.save()
+
+        # 1. Draw the roundabout ring circle (driven segment vs non-driven segment)
+        ellipse_rect = QRectF(cx - r, cy - r, r * 2, r * 2)
+        start_angle_driven = -90.0
+        span_angle_driven = -direction_sign * exit_number * (360.0 / n)
+        
+        # A. Driven segment (highlighted)
+        painter.setPen(QPen(QColor("#FFFFFF"), 2.5, Qt.SolidLine, Qt.RoundCap))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawArc(ellipse_rect, int(start_angle_driven * 16), int(span_angle_driven * 16))
+        
+        # B. Non-driven segment (dimmed)
+        start_angle_nondriven = -90.0 + span_angle_driven
+        span_angle_nondriven = -direction_sign * (360.0 - exit_number * (360.0 / n))
+        painter.setPen(QPen(QColor(180, 180, 180, 140), 1.5, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(ellipse_rect, int(start_angle_nondriven * 16), int(span_angle_nondriven * 16))
+
+        # 2. Draw all arms (dim colour for non-chosen exits)
+        for k in range(1, n + 1):
+            ring_pt, tip_pt = arm_tip(k)
+            is_chosen = (k == exit_number)
+            arm_color = QColor("#FFFFFF") if is_chosen else QColor(180, 180, 180, 140)
+            arm_width  = 2.5 if is_chosen else 1.5
+            painter.setPen(QPen(arm_color, arm_width, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(ring_pt, tip_pt)
+
+        # 3. Draw the entry arm (highlighted, pointing down from ring)
+        entry_ring, entry_tip = arm_tip(0)
+        painter.setPen(QPen(QColor("#FFFFFF"), 2.5, Qt.SolidLine, Qt.RoundCap))
+        # Entry arm points outward from the bottom of the ring toward the driver
+        painter.drawLine(entry_ring, entry_tip)
+
+        # 4. Draw arrowhead on the chosen exit arm
+        chosen_ring, chosen_tip = arm_tip(exit_number)
+        deg_chosen = entry_angle_deg + exit_number * angle_step
+        painter.save()
+        painter.translate(chosen_tip)
+        painter.rotate(deg_chosen)
+        arrow_size = 4.0
+        arrowhead = QPolygonF([
+            QPointF(0, -arrow_size * 1.5),
+            QPointF(-arrow_size, 0),
+            QPointF( arrow_size, 0),
+        ])
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawPolygon(arrowhead)
+        painter.restore()
+
+        # 5. Draw exit number digit at the centre of the ring
+        painter.setFont(QFont("Segoe UI", max(6, int(r * 0.9)), QFont.Bold))
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(
+            QRectF(cx - r, cy - r, r * 2, r * 2),
+            Qt.AlignCenter,
+            str(exit_number),
+        )
+
+        painter.restore()
 
     def format_nav_distance(self, dist_meters):
         if dist_meters < 1000.0:
@@ -2311,6 +2406,37 @@ class MainWindow(QMainWindow):
     def update_load_progress(self, pct):
         self.progress_bar.setValue(pct)
   
+    def update_navigation_buttons_state(self):
+        route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route.points) > 0
+        if not route_exists:
+            # Disable all navigation buttons if no route
+            self.btn_start_nav.setEnabled(False)
+            self.btn_pause_nav.setEnabled(False)
+            self.btn_stop_nav.setEnabled(False)
+            self.btn_pause_nav.setText("⏸ Pause Nav")
+            return
+
+        # We have a route, determine states based on navigation_state
+        state = self.map_widget.navigation_state
+        gps_active = self.active_gps_device is not None
+        
+        if state == "inactive":
+            # We have a route, but not navigating
+            self.btn_start_nav.setEnabled(gps_active)
+            self.btn_pause_nav.setEnabled(False)
+            self.btn_stop_nav.setEnabled(False)
+            self.btn_pause_nav.setText("⏸ Pause Nav")
+        elif state == "navigating":
+            self.btn_start_nav.setEnabled(False)
+            self.btn_pause_nav.setEnabled(True)
+            self.btn_stop_nav.setEnabled(True)
+            self.btn_pause_nav.setText("⏸ Pause Nav")
+        elif state == "paused":
+            self.btn_start_nav.setEnabled(False)
+            self.btn_pause_nav.setEnabled(True)
+            self.btn_stop_nav.setEnabled(True)
+            self.btn_pause_nav.setText("▶ Continue Nav")
+
     def set_controls_enabled(self, enabled):
         self.btn_open_file.setEnabled(enabled)
         self.search_box_a.setEnabled(enabled)
@@ -2322,12 +2448,7 @@ class MainWindow(QMainWindow):
             self.combo_profile.setEnabled(has_routing)
             self.btn_clear_route.setEnabled(has_routing)
             self.combo_gps.setEnabled(True)
-            # Only enable Start Nav if a route actually exists and a GPS is active
-            route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route.points) > 0
-            gps_active = self.active_gps_device is not None
-            self.btn_start_nav.setEnabled(route_exists and gps_active)
-            self.btn_pause_nav.setEnabled(self.map_widget.navigation_state == "navigating" and gps_active)
-            self.btn_stop_nav.setEnabled(self.map_widget.navigation_state != "inactive")
+            self.update_navigation_buttons_state()
         else:
             self.combo_profile.setEnabled(False)
             self.btn_clear_route.setEnabled(False)
@@ -2442,7 +2563,7 @@ class MainWindow(QMainWindow):
                 previous_row = current_row
             return previous_row[-1]
             
-        if len(q) >= 3 and len(suggestions) < 15:
+        if len(q) >= 3 and len(suggestions) == 0:
             first_char = q[0]
             candidates = [
                 (sk, dn) for sk, dn in self.all_search_names
@@ -2738,11 +2859,6 @@ class MainWindow(QMainWindow):
                     print("Error stopping GPS on route clear:", e)
             self.map_widget.gps_position = None
             self.map_widget.gps_heading = 0.0
-            
-            # Reset navigation buttons
-            self.btn_start_nav.setEnabled(False)
-            self.btn_pause_nav.setEnabled(False)
-            self.btn_stop_nav.setEnabled(False)
             self.tts_manager.reset()
             
         self.map_widget.route_start = None
@@ -2751,6 +2867,7 @@ class MainWindow(QMainWindow):
         self.desc_a = ""
         self.desc_b = ""
         self.update_search_inputs()
+        self.update_navigation_buttons_state()
         self.status_bar.showMessage("Route and navigation cleared.")
         self.map_widget.update()
 
@@ -2771,11 +2888,7 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("GPS disabled.")
             self.map_widget.gps_position = None
             self.map_widget.gps_heading = 0.0
-            
-            # Update navigation button states
-            self.btn_start_nav.setEnabled(False)
-            self.btn_pause_nav.setEnabled(False)
-            self.btn_stop_nav.setEnabled(False)
+            self.update_navigation_buttons_state()
             self.map_widget.update()
             return
             
@@ -2785,26 +2898,16 @@ class MainWindow(QMainWindow):
         self.active_gps_device.position_updated.connect(self.on_gps_position_updated)
         self.active_gps_device.status_message.connect(self.on_gps_status_message)
         
-        if self.map_widget.navigation_state == "navigating":
-            self.tts_manager.align_tracking_baseline()
+        if self.map_widget.navigation_state in ("navigating", "paused"):
             self.active_gps_device.update_route(self.map_widget.current_route.points)
-            self.active_gps_device.start()
-            self.btn_start_nav.setEnabled(False)
-            self.btn_pause_nav.setEnabled(True)
-            self.btn_stop_nav.setEnabled(True)
-        elif self.map_widget.navigation_state == "paused":
-            self.active_gps_device.update_route(self.map_widget.current_route.points)
-            self.btn_start_nav.setEnabled(True)
-            self.btn_pause_nav.setEnabled(False)
-            self.btn_stop_nav.setEnabled(True)
+            if self.map_widget.navigation_state == "navigating":
+                self.tts_manager.align_tracking_baseline()
+                self.active_gps_device.start()
         else:
             # Active but not in navigation mode (e.g. standard tracking)
             self.active_gps_device.start()
-            route_exists = self.map_widget.current_route is not None and len(self.map_widget.current_route.points) > 0
-            self.btn_start_nav.setEnabled(route_exists)
-            self.btn_pause_nav.setEnabled(False)
-            self.btn_stop_nav.setEnabled(False)
             
+        self.update_navigation_buttons_state()
         self.status_bar.showMessage(f"Activated GPS: {device.get_name()}")
 
     def on_gps_position_updated(self, lat, lon, speed_knots, heading, quality):
@@ -2851,7 +2954,7 @@ class MainWindow(QMainWindow):
 
     def start_navigation(self):
         """
-        Starts or resumes route navigation and movement tracking.
+        Starts route navigation and movement tracking.
         """
         if not self.map_widget.current_route:
             QMessageBox.warning(self, "Navigation", "Please establish a route first.")
@@ -2860,10 +2963,7 @@ class MainWindow(QMainWindow):
         self.map_widget.navigation_state = "navigating"
         self.tts_manager.align_tracking_baseline()
         
-        # Enable tracking buttons
-        self.btn_start_nav.setEnabled(False)
-        self.btn_pause_nav.setEnabled(True)
-        self.btn_stop_nav.setEnabled(True)
+        self.update_navigation_buttons_state()
         
         if self.active_gps_device is not None:
             self.active_gps_device.update_route(self.map_widget.current_route.points)
@@ -2891,18 +2991,20 @@ class MainWindow(QMainWindow):
 
     def pause_navigation(self):
         """
-        Pauses active navigation movement tracking.
+        Toggles pause/resume of active navigation movement tracking.
         """
-        self.map_widget.navigation_state = "paused"
-        self.btn_start_nav.setEnabled(True)
-        self.btn_pause_nav.setEnabled(False)
-        self.btn_stop_nav.setEnabled(True)
-        
-        if self.active_gps_device is not None:
-            # Stopping the device stops the simulation timer or serial reads
-            self.active_gps_device.stop()
+        if self.map_widget.navigation_state == "navigating":
+            self.map_widget.navigation_state = "paused"
+            if self.active_gps_device is not None:
+                self.active_gps_device.stop()
+            self.status_bar.showMessage("Navigation paused.")
+        elif self.map_widget.navigation_state == "paused":
+            self.map_widget.navigation_state = "navigating"
+            if self.active_gps_device is not None:
+                self.active_gps_device.start()
+            self.status_bar.showMessage("Navigation resumed.")
             
-        self.status_bar.showMessage("Navigation paused.")
+        self.update_navigation_buttons_state()
 
     def cancel_navigation(self):
         """
@@ -2918,24 +3020,17 @@ class MainWindow(QMainWindow):
         if self.active_gps_device is not None:
             self.active_gps_device.update_route(self.map_widget.current_route.points)
             
-        # Enable the Start Nav button since we now have a route path
-        if self.active_gps_device is not None:
-            self.btn_start_nav.setEnabled(True)
         self.btn_clear_route.setEnabled(True)
+        self.update_navigation_buttons_state()
         
-        # Load route directions into TTS Manager
-        self.tts_manager.set_route_directions(
-            self.map_widget.current_route.directions,
-            self.map_widget.current_route.points
-        )
+        # Load route structured steps into TTS Manager
+        self.tts_manager.set_route(self.map_widget.current_route)
 
     def on_mainwindow_route_failed(self, err_msg):
         """
         Triggered when route calculations fail.
         """
-        self.btn_start_nav.setEnabled(False)
-        self.btn_pause_nav.setEnabled(False)
-        self.btn_stop_nav.setEnabled(False)
+        self.update_navigation_buttons_state()
 
     def find_coordinates_for_search(self, search_text):
         """

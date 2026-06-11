@@ -110,7 +110,7 @@ class TTSManager(QObject):
         self._refresh_audio_source()
         
         self.navigation_steps = []
-        self.notified_distances = {} # step_idx -> set of distance integers
+        self.spoken_steps = set()        # indices of steps for which TTS has already fired
         self.prev_dist_to_turn = None
         self.prev_step_idx = -1
         self.last_speak_time = 0.0
@@ -132,7 +132,7 @@ class TTSManager(QObject):
     def reset(self):
         """Resets the notified states."""
         self.navigation_steps = []
-        self.notified_distances = {}
+        self.spoken_steps = set()
         self.prev_dist_to_turn = None
         self.prev_step_idx = -1
         self.last_speak_time = 0.0
@@ -167,9 +167,32 @@ class TTSManager(QObject):
             self.tts.stop()
         self.tts.say(text)
         
+    def set_route(self, route):
+        """
+        Loads a ComputedRoute into the navigation engine.
+        Reads the structured route.steps list directly — no text parsing.
+        Each step dict must contain at minimum: junc_pt (QPointF), and all
+        metadata keys produced by find_route_astar (type, angle, speakable, etc.).
+        """
+        self.reset()
+        route_points = route.points
+        for step in route.steps:
+            junc_pt = step["junc_pt"]
+            # Snap the junction Mercator point to the nearest route point index
+            min_d2 = float('inf')
+            junc_idx = 0
+            for p_idx, pt in enumerate(route_points):
+                d2 = (pt.x() - junc_pt.x())**2 + (pt.y() - junc_pt.y())**2
+                if d2 < min_d2:
+                    min_d2 = d2
+                    junc_idx = p_idx
+            self.navigation_steps.append({**step, "junc_idx": junc_idx})
+
     def set_route_directions(self, directions, route_points):
         """
-        Parses instructions and pre-projects their target coordinates to find segment indices.
+        Legacy shim kept for backward compatibility (existing tests pass plain string lists).
+        Parses instruction strings to build minimal navigation steps.
+        Prefer set_route() when a full ComputedRoute object is available.
         """
         self.reset()
         
@@ -191,12 +214,24 @@ class TTSManager(QObject):
                         junc_idx = p_idx
                         
                 speakable_action = get_speakable_action(instr)
+                # Infer speakable from text for backward-compat path
+                action_lower = speakable_action.lower()
+                is_speakable = any(k in action_lower for k in
+                                   ("turn left", "turn right", "bear left", "bear right",
+                                    "sharp left", "sharp right", "roundabout"))
                 self.navigation_steps.append({
                     "index": idx,
                     "junc_pt": junc_pt,
                     "junc_idx": junc_idx,
                     "speakable_action": speakable_action,
-                    "original_text": instr
+                    "original_text": instr,
+                    # Minimal structured fields so update_navigation works uniformly
+                    "type": "roundabout" if "roundabout" in action_lower else "turn",
+                    "angle": 0.0,
+                    "exit_number": 0,
+                    "total_exits": 0,
+                    "speakable": is_speakable,
+                    "driving_side": "left",
                 })
                 
     def find_closest_route_index(self, route_points, gps_pt):
@@ -215,6 +250,7 @@ class TTSManager(QObject):
         """
         Tracks vehicle progression against the next navigation step.
         Spoken notifications or beep alerts are triggered when transitioning across distance thresholds.
+        Each junction step is announced at most once regardless of how many thresholds are crossed.
         Visual HUD state (next_action, after_next_action) is always updated regardless of tts_mode.
         """
             
@@ -224,7 +260,7 @@ class TTSManager(QObject):
         # 1. Snap GPS coordinate to route
         gps_idx, snapped_gps = self.find_closest_route_index(route_points, gps_pt)
         
-        # 2. Find the first upcoming turn ahead of theSnapped index
+        # 2. Find the first upcoming turn ahead of the snapped index
         next_step = None
         next_step_idx = -1
         for i, step in enumerate(self.navigation_steps):
@@ -255,7 +291,7 @@ class TTSManager(QObject):
             self.after_next_action = step_after
             self.after_next_action_distance = dist_to_turn + dist_between
         
-        # Reset tracking parameters if the turn has changed
+        # Reset tracking parameters if the step has changed
         if next_step_idx != self.prev_step_idx:
             self.prev_step_idx = next_step_idx
             self.prev_dist_to_turn = dist_to_turn
@@ -270,56 +306,66 @@ class TTSManager(QObject):
             self.prev_dist_to_turn = dist_to_turn
             return
 
-        # 5. Fetch the target notification distances from profile configuration
+        # 5. Resolve the step to announce.
+        #    Primary: next_step if it is speakable and not yet spoken.
+        #    Fallback: if next_step is non-speakable (e.g. "continue onto roundabout")
+        #    but after_next_action is speakable (e.g. a roundabout exit), pre-announce
+        #    the after-next step using the APPROACH distance to the current junction.
+        #    This ensures the roundabout is announced while the driver is still
+        #    approaching the entry, not after they have already entered it.
+        is_speakable = next_step.get("speakable", False)
+        
+        announce_step = None
+        announce_step_idx = None
+
+        if is_speakable and next_step_idx not in self.spoken_steps:
+            announce_step = next_step
+            announce_step_idx = next_step_idx
+        elif (not is_speakable
+              and self.after_next_action is not None
+              and self.after_next_action.get("speakable", False)):
+            after_idx = next_step_idx + 1
+            if after_idx not in self.spoken_steps:
+                announce_step = self.after_next_action
+                announce_step_idx = after_idx
+
+        if announce_step is None:
+            self.prev_dist_to_turn = dist_to_turn
+            return
+
+        # 6. Fetch the target notification distances from profile configuration
         target_distances = active_profile.get("tts_distances", [500, 200, 50])
         target_distances = sorted(list(target_distances), reverse=True)
         
-        # 6. Detect crossed thresholds
-        crossed_thresholds = []
-        if next_step_idx not in self.notified_distances:
-            self.notified_distances[next_step_idx] = set()
-            
+        # 7. Detect whether any threshold has been crossed
+        crossed = False
+        chosen_threshold = None
         for threshold in target_distances:
-            # Check if we transitioned from above to below the threshold in this step
-            if self.prev_dist_to_turn > threshold and dist_to_turn <= threshold:
-                if threshold not in self.notified_distances[next_step_idx]:
-                    crossed_thresholds.append(threshold)
+            if self.prev_dist_to_turn > threshold >= dist_to_turn:
+                crossed = True
+                chosen_threshold = threshold
+                break   # fire on the largest crossed threshold; one notification only
                     
-        if crossed_thresholds:
-            # Select the smallest (closest/most recent) crossed threshold
-            chosen_threshold = min(crossed_thresholds)
+        if crossed:
+            # Mark as spoken immediately so no subsequent threshold fires again
+            self.spoken_steps.add(announce_step_idx)
             
-            # Check if we skipped any larger crossed thresholds in this single hop
-            skipped = len(crossed_thresholds) > 1
-            
-            # Also mark all crossed thresholds as notified so we don't repeat them
-            for t in crossed_thresholds:
-                self.notified_distances[next_step_idx].add(t)
+            if tts_mode == "sound_only":
+                self.play_beep()
+            elif tts_mode == "full":
+                import time
+                current_time = time.time()
+                cooldown = 6.0
+                is_speaking = (self.tts.state() == QTextToSpeech.State.Speaking)
+                in_cooldown = (current_time - self.last_speak_time < cooldown)
+                is_busy = is_speaking or in_cooldown
                 
-            # Only turns/roundabout actions must be announced
-            action_text = next_step.get("speakable_action", "")
-            is_turn = any(k in action_text.lower() for k in ["turn", "bear", "roundabout", "sharp"])
-            
-            if is_turn:
-                if tts_mode == "sound_only":
+                if is_busy:
                     self.play_beep()
-                elif tts_mode == "full":
-                    # Check if TTS is busy (either active speaking or within cooldown)
-                    import time
-                    current_time = time.time()
-                    cooldown = 6.0  # seconds required to notify in full
-                    is_speaking = (self.tts.state() == QTextToSpeech.State.Speaking)
-                    in_cooldown = (current_time - self.last_speak_time < cooldown)
-                    is_busy = is_speaking or in_cooldown
                     
-                    # Play beep if busy or if a threshold was skipped
-                    if is_busy or skipped:
-                        self.play_beep()
-                        
-                    if not is_busy:
-                        # Say the instruction
-                        text = f"In {int(chosen_threshold)} meters, {next_step['speakable_action']}"
-                        self.speak(text)
-                        self.last_speak_time = current_time
+                if not is_busy:
+                    text = f"In {int(chosen_threshold)} meters, {announce_step['speakable_action']}"
+                    self.speak(text)
+                    self.last_speak_time = current_time
             
         self.prev_dist_to_turn = dist_to_turn
